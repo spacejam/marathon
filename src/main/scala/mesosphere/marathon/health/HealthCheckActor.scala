@@ -2,7 +2,7 @@ package mesosphere.marathon.health
 
 import akka.actor.{ Actor, ActorLogging, ActorRef, Cancellable, Props }
 import akka.event.EventStream
-import mesosphere.marathon.MarathonSchedulerDriver
+import mesosphere.marathon.{ MarathonScheduler, MarathonSchedulerDriverHolder }
 import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.event._
@@ -13,6 +13,8 @@ import mesosphere.mesos.protos.TaskID
 class HealthCheckActor(
     appId: PathId,
     appVersion: String,
+    marathonSchedulerDriverHolder: MarathonSchedulerDriverHolder,
+    marathonScheduler: MarathonScheduler,
     healthCheck: HealthCheck,
     taskTracker: TaskTracker,
     eventBus: EventStream) extends Actor with ActorLogging {
@@ -79,7 +81,7 @@ class HealthCheckActor(
   def dispatchJobs(): Unit = {
     log.debug("Dispatching health check jobs to workers")
     taskTracker.get(appId).foreach { task =>
-      if (task.getVersion() == appVersion && task.hasStartedAt) {
+      if (task.getVersion == appVersion && task.hasStartedAt) {
         log.debug("Dispatching health check job for task [{}]", task.getId)
         val worker: ActorRef = context.actorOf(workerProps)
         worker ! HealthCheckJob(task, healthCheck)
@@ -94,16 +96,12 @@ class HealthCheckActor(
 
     // ignore failures if maxFailures == 0
     if (consecutiveFailures >= maxFailures && maxFailures > 0) {
-      log.info(f"Killing task ${task.getId} on host ${task.getHost}")
+      log.info(f"Detected unhealthy task ${task.getId} on host ${task.getHost}")
 
       // kill the task
-      MarathonSchedulerDriver.driver.foreach { driver =>
+      marathonSchedulerDriverHolder.driver.foreach { driver =>
+        log.info(s"Send kill request for task ${task.getId} on host ${task.getHost} to driver")
         driver.killTask(TaskID(task.getId))
-      }
-
-      // increase the task launch delay for this questionably healthy app
-      MarathonSchedulerDriver.scheduler.foreach { scheduler =>
-        scheduler.unhealthyTaskKilled(appId, task.getId)
       }
     }
   }
@@ -117,6 +115,8 @@ class HealthCheckActor(
       task.getStartedAt + healthCheck.gracePeriod.toMillis > System.currentTimeMillis()
   }
 
+  //TODO: fix style issue and enable this scalastyle check
+  //scalastyle:off cyclomatic.complexity method.length
   def receive: Receive = {
     case GetTaskHealth(taskId) => sender() ! taskHealth.getOrElse(taskId, Health(taskId))
 

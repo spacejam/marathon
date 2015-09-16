@@ -14,7 +14,7 @@ import scala.concurrent.Future
   */
 class PromiseActor(promise: Promise[Any]) extends Actor {
   def receive: Receive = {
-    case x =>
+    case x: Any =>
       x match {
         case Status.Failure(t) => promise.failure(t)
         case Status.Success(x) => promise.success(x)
@@ -27,7 +27,7 @@ class PromiseActor(promise: Promise[Any]) extends Actor {
 object PromiseActor {
   /**
     * Sends the given message to the given actorRef and waits indefinitely for the response. The response
-    * must be of the given type T or a [[Status.Failure]].
+    * must be of the given type T or a `akka.actor.Status.Failure`.
     *
     * @param actorRefFactory the factory for creating the internally used actor
     * @param actorRef references the actor to send the message to

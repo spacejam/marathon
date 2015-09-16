@@ -2,46 +2,77 @@ import sbt._
 import Keys._
 import sbtassembly.Plugin._
 import AssemblyKeys._
-import sbtrelease.ReleasePlugin._
 import com.typesafe.sbt.SbtScalariform._
 import net.virtualvoid.sbt.graph.Plugin.graphSettings
-import ohnosequences.sbt.SbtS3Resolver.S3Resolver
-import ohnosequences.sbt.SbtS3Resolver.{ s3, s3resolver }
-import org.scalastyle.sbt.ScalastylePlugin.{ Settings => styleSettings }
-import scalariform.formatter.preferences._
 import sbtbuildinfo.Plugin._
 import spray.revolver.RevolverPlugin.Revolver.{settings => revolverSettings}
+import sbtrelease._
+import ReleasePlugin._
+import ReleaseStateTransformations._
 
 object MarathonBuild extends Build {
-  lazy val root = Project(
+  lazy val root: Project = Project(
     id = "marathon",
     base = file("."),
     settings = baseSettings ++
                asmSettings ++
-               releaseSettings ++
-               publishSettings ++
-               formatSettings ++
-               styleSettings ++
+               customReleaseSettings ++
                revolverSettings ++
                graphSettings ++
-      Seq(
-        libraryDependencies ++= Dependencies.root,
-        parallelExecution in Test := false,
-        fork in Test := true
-      )
+               testSettings ++
+               integrationTestSettings ++
+               teamCitySetEnvSettings ++
+               Seq(
+                 libraryDependencies ++= Dependencies.root,
+                 parallelExecution in Test := false,
+                 fork in Test := true
+               )
     )
     .configs(IntegrationTest)
-    .settings(inConfig(IntegrationTest)(Defaults.testTasks): _*)
-    .settings(testOptions in Test := Seq(Tests.Argument("-l", "integration")))
-    .settings(testOptions in IntegrationTest := Seq(Tests.Argument("-n", "integration")))
+    // run mesos-simulation/test:test when running test
+    .settings((test in Test) <<= (test in Test) dependsOn (test in Test in LocalProject("mesosSimulation")))
 
-  lazy val testScalaStyle = taskKey[Unit]("testScalaStyle")
+  lazy val mesosSimulation: Project = Project(
+    id = "mesosSimulation",
+    base = file("mesos-simulation"),
+    settings = baseSettings ++
+      revolverSettings ++
+      testSettings ++
+      integrationTestSettings
+    ).dependsOn(root % "compile->compile; test->test").configs(IntegrationTest)
+
+  /**
+   * Determine scala test runner output. `-e` for reporting on standard error.
+   *
+   * W - without color
+   * D - show all durations
+   * S - show short stack traces
+   * F - show full stack traces
+   * U - unformatted mode
+   * I - show reminder of failed and canceled tests without stack traces
+   * T - show reminder of failed and canceled tests with short stack traces
+   * G - show reminder of failed and canceled tests with full stack traces
+   * K - exclude TestCanceled events from reminder
+   *
+   * http://scalatest.org/user_guide/using_the_runner
+   */
+  lazy val integrationTestSettings = inConfig(IntegrationTest)(Defaults.testTasks) ++
+    Seq(
+      testOptions in IntegrationTest := Seq(Tests.Argument("-n", "integration"))
+    )
+
+  lazy val testSettings = Seq(
+    testOptions in Test := Seq(Tests.Argument("-l", "integration")),
+    parallelExecution in Test := false,
+    fork in Test := true
+  )
 
   lazy val IntegrationTest = config("integration") extend Test
 
   lazy val baseSettings = Defaults.defaultSettings ++ buildInfoSettings ++ Seq (
     organization := "mesosphere",
     scalaVersion := "2.11.5",
+    crossScalaVersions := Seq(scalaVersion.value),
     scalacOptions in Compile ++= Seq(
       "-encoding", "UTF-8",
       "-target:jvm-1.6",
@@ -58,18 +89,13 @@ object MarathonBuild extends Build {
     javacOptions in Compile ++= Seq("-encoding", "UTF-8", "-source", "1.6", "-target", "1.6", "-Xlint:unchecked", "-Xlint:deprecation"),
     resolvers ++= Seq(
       "Mesosphere Public Repo"    at "http://downloads.mesosphere.io/maven",
-      "Twitter Maven2 Repository" at "http://maven.twttr.com/",
       "Typesafe Releases" at "http://repo.typesafe.com/typesafe/releases/",
       "Spray Maven Repository"    at "http://repo.spray.io/"
     ),
     sourceGenerators in Compile <+= buildInfo,
     fork in Test := true,
     buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion),
-    buildInfoPackage := "mesosphere.marathon",
-    testScalaStyle := {
-      org.scalastyle.sbt.PluginKeys.scalastyle.toTask("").value
-    },
-    (test in Test) <<= (test in Test) dependsOn testScalaStyle
+    buildInfoPackage := "mesosphere.marathon"
   )
 
   lazy val asmSettings = assemblySettings ++ Seq(
@@ -96,31 +122,48 @@ object MarathonBuild extends Build {
     }
   )
 
-  lazy val publishSettings = S3Resolver.defaults ++ Seq(
-    publishTo := Some(s3resolver.value(
-      "Mesosphere Public Repo (S3)",
-      s3("downloads.mesosphere.com/maven")
+  /**
+   * This is the standard release process without
+   * -publishArtifacts
+   * -setNextVersion
+   * -commitNextVersion
+   */
+  lazy val customReleaseSettings = releaseSettings ++ Seq(
+    ReleaseKeys.releaseProcess := Seq[ReleaseStep](
+      checkSnapshotDependencies,
+      inquireVersions,
+      runTest,
+      setReleaseVersion,
+      commitReleaseVersion,
+      tagRelease,
+      pushChanges
     ))
-  )
 
-  lazy val formatSettings = scalariformSettings ++ Seq(
-    ScalariformKeys.preferences := FormattingPreferences()
-      .setPreference(IndentWithTabs, false)
-      .setPreference(IndentSpaces, 2)
-      .setPreference(AlignParameters, true)
-      .setPreference(DoubleIndentClassDeclaration, true)
-      .setPreference(MultilineScaladocCommentsStartOnFirstLine, false)
-      .setPreference(PlaceScaladocAsterisksBeneathSecondAsterisk, true)
-      .setPreference(PreserveDanglingCloseParenthesis, true)
-      .setPreference(CompactControlReadability, true) //MV: should be false!
-      .setPreference(AlignSingleLineCaseStatements, true)
-      .setPreference(PreserveSpaceBeforeArguments, true)
-      .setPreference(SpaceBeforeColon, false)
-      .setPreference(SpaceInsideBrackets, false)
-      .setPreference(SpaceInsideParentheses, false)
-      .setPreference(SpacesWithinPatternBinders, true)
-      .setPreference(FormatXml, true)
-    )
+  /**
+   * This on load trigger is used to set parameters in teamcity.
+   * It is only executed within teamcity and can be ignored otherwise.
+   * It will set values as build and env parameter.
+   * Those parameters can be used in subsequent build steps and dependent builds.
+   * TeamCity does this by watching the output of the build it currently performs.
+   * See: https://confluence.jetbrains.com/display/TCD8/Build+Script+Interaction+with+TeamCity
+   */
+  lazy val teamCitySetEnvSettings = Seq(
+    onLoad in Global := {
+      sys.env.get("TEAMCITY_VERSION") match {
+        case None => // no-op
+        case Some(teamcityVersion) =>
+          def reportParameter(key: String, value: String): Unit = {
+            //env parameters will be made available as environment variables
+            println(s"##teamcity[setParameter name='env.SBT_$key' value='$value']")
+            //system parameters will be made available as teamcity build parameters
+            println(s"##teamcity[setParameter name='system.sbt.$key' value='$value']")
+          }
+          reportParameter("SCALA_VERSION", scalaVersion.value)
+          reportParameter("PROJECT_VERSION", version.value)
+      }
+      (onLoad in Global).value
+    }
+  )
 }
 
 object Dependencies {
@@ -132,15 +175,14 @@ object Dependencies {
     akkaSlf4j % "compile",
     sprayClient % "compile",
     sprayHttpx % "compile",
-    chaos % "compile",
     mesosUtils % "compile",
     jacksonCaseClass % "compile",
     twitterCommons % "compile",
-    twitterZkClient % "compile",
     jodaTime % "compile",
     jodaConvert % "compile",
     jerseyServlet % "compile",
     jerseyMultiPart % "compile",
+    jettyEventSource % "compile",
     uuidGenerator % "compile",
     jGraphT % "compile",
     hadoopHdfs % "compile",
@@ -148,6 +190,36 @@ object Dependencies {
     beanUtils % "compile",
     scallop % "compile",
     playJson % "compile",
+    jsonSchemaValidator % "compile",
+    twitterZk % "compile",
+
+    /////// runtime
+    guava % "compile",
+    guice % "compile",
+    guiceServlet % "compile",
+    jettyServer % "compile",
+    jettyServlet % "compile",
+    jettySecurity % "compile",
+    jerseyCore % "compile",
+    jerseyServer % "compile",
+    jerseyGuice % "compile",
+    jacksonScala % "compile",
+    jacksonJaxrs % "compile",
+    hibernate % "compile",
+    glassfish % "compile",
+
+
+    metricsJersey % "compile",
+    metricsJvm % "compile",
+    metricsJetty % "compile",
+    metricsServlets % "compile",
+
+    slf4jLog4j % "compile",
+    slf4jJul % "compile",
+    log4j % "compile",
+    liftMD % "compile",
+    mustache % "compile",
+    ///////
 
     // test
     Test.scalatest % "test",
@@ -159,21 +231,32 @@ object Dependencies {
 object Dependency {
   object V {
     // runtime deps versions
-    val Chaos = "0.6.3"
+    val Chaos = "0.6.5"
     val JacksonCCM = "0.1.2"
-    val MesosUtils = "0.22.0-1"
+    val MesosUtils = "0.23.0"
     val Akka = "2.3.9"
     val Spray = "1.3.2"
     val TwitterCommons = "0.0.76"
-    val TwitterZKClient = "0.0.70"
-    val Jersey = "1.18.1"
+    val TwitterZk = "6.24.0"
+    val Jetty = "8.1.15.v20140411"
+    val JettyEventSource = "1.0.0"
     val JodaTime = "2.3"
     val JodaConvert = "1.6"
     val UUIDGenerator = "3.1.3"
     val JGraphT = "0.9.1"
     val Hadoop = "2.4.1"
-    val Scallop = "0.9.5"
     val PlayJson = "2.3.7"
+    val JsonSchemaValidator = "2.2.6"
+
+    val Slf4j = "1.7.7"
+    val Metrics = "3.0.2"
+    val Guava = "17.0"
+    val Guice = "3.0"
+    val Scallop = "0.9.5"
+    val Jersey = "1.18.1"
+    val Jackson = "2.4.1"
+    val Hibernate = "5.1.2.Final"
+    val Mustache = "0.8.12"
 
     // test deps versions
     val Mockito = "1.9.5"
@@ -183,26 +266,50 @@ object Dependency {
   val excludeMortbayJetty = ExclusionRule(organization = "org.mortbay.jetty")
   val excludeJavaxServlet = ExclusionRule(organization = "javax.servlet")
 
+  val guava = "com.google.guava" % "guava" % V.Guava
+  val guice = "com.google.inject" % "guice" % V.Guice
+  val guiceServlet = "com.google.inject.extensions" % "guice-servlet" % V.Guice
+  val jettyServer = "org.eclipse.jetty" % "jetty-server" % V.Jetty
+  val jettyServlet = "org.eclipse.jetty" % "jetty-servlet" % V.Jetty
+  val jettySecurity = "org.eclipse.jetty" % "jetty-security" % V.Jetty
+  val jerseyCore = "com.sun.jersey" % "jersey-core" % V.Jersey
+  val jerseyServlet = "com.sun.jersey" % "jersey-servlet" % V.Jersey
+  val jerseyGuice = "com.sun.jersey.contribs" % "jersey-guice" % V.Jersey
+  val jacksonScala = "com.fasterxml.jackson.module" %% "jackson-module-scala" % V.Jackson
+  val jacksonJaxrs = "com.fasterxml.jackson.jaxrs" % "jackson-jaxrs-json-provider" % V.Jackson
+  val jerseyServer = "com.sun.jersey" % "jersey-server" % V.Jersey
+  val hibernate = "org.hibernate" % "hibernate-validator" % V.Hibernate
+  val glassfish = "org.glassfish.web" % "javax.el" % "2.2.5"
+  val metricsJersey = "com.codahale.metrics" % "metrics-jersey" % V.Metrics
+  val metricsJvm = "com.codahale.metrics" % "metrics-jvm" % V.Metrics
+  val metricsJetty = "com.codahale.metrics" % "metrics-jetty8" % V.Metrics
+  val metricsServlets = "com.codahale.metrics" % "metrics-servlets" % V.Metrics
+  val mustache = "com.github.spullara.mustache.java" % "compiler" % V.Mustache
+  val slf4jLog4j = "org.slf4j" % "slf4j-log4j12" % V.Slf4j
+  val slf4jJul = "org.slf4j" % "jul-to-slf4j" % V.Slf4j
+  val log4j = "log4j" % "log4j" % "1.2.17"
+  val liftMD = "net.liftweb" %% "lift-markdown" % "2.6-M4"
+
   val akkaActor = "com.typesafe.akka" %% "akka-actor" % V.Akka
   val akkaSlf4j = "com.typesafe.akka" %% "akka-slf4j" % V.Akka
   val sprayClient = "io.spray" %% "spray-client" % V.Spray
   val sprayHttpx = "io.spray" %% "spray-httpx" % V.Spray
   val playJson = "com.typesafe.play" %% "play-json" % V.PlayJson
-  val chaos = "mesosphere" %% "chaos" % V.Chaos
   val mesosUtils = "mesosphere" %% "mesos-utils" % V.MesosUtils
   val jacksonCaseClass = "mesosphere" %% "jackson-case-class-module" % V.JacksonCCM
-  val jerseyServlet =  "com.sun.jersey" % "jersey-servlet" % V.Jersey
+  val jettyEventSource = "org.eclipse.jetty" % "jetty-eventsource-servlet" % V.JettyEventSource
   val jerseyMultiPart =  "com.sun.jersey.contribs" % "jersey-multipart" % V.Jersey
   val jodaTime = "joda-time" % "joda-time" % V.JodaTime
   val jodaConvert = "org.joda" % "joda-convert" % V.JodaConvert
   val twitterCommons = "com.twitter.common.zookeeper" % "candidate" % V.TwitterCommons
-  val twitterZkClient = "com.twitter.common.zookeeper" % "client" % V.TwitterZKClient
   val uuidGenerator = "com.fasterxml.uuid" % "java-uuid-generator" % V.UUIDGenerator
   val jGraphT = "org.javabits.jgrapht" % "jgrapht-core" % V.JGraphT
   val hadoopHdfs = "org.apache.hadoop" % "hadoop-hdfs" % V.Hadoop excludeAll(excludeMortbayJetty, excludeJavaxServlet)
   val hadoopCommon = "org.apache.hadoop" % "hadoop-common" % V.Hadoop excludeAll(excludeMortbayJetty, excludeJavaxServlet)
   val beanUtils = "commons-beanutils" % "commons-beanutils" % "1.9.2"
   val scallop = "org.rogach" %% "scallop" % V.Scallop
+  val jsonSchemaValidator = "com.github.fge" % "json-schema-validator" % V.JsonSchemaValidator
+  val twitterZk = "com.twitter" %% "util-zk" % V.TwitterZk
 
   object Test {
     val scalatest = "org.scalatest" %% "scalatest" % V.ScalaTest

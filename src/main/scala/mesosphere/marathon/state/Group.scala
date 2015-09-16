@@ -12,10 +12,10 @@ import scala.collection.JavaConversions._
 
 case class Group(
     id: PathId,
-    apps: Set[AppDefinition] = DefaultApps,
-    groups: Set[Group] = DefaultGroups,
-    dependencies: Set[PathId] = DefaultDependencies,
-    version: Timestamp = DefaultVersion) extends MarathonState[GroupDefinition, Group] {
+    apps: Set[AppDefinition] = defaultApps,
+    groups: Set[Group] = defaultGroups,
+    dependencies: Set[PathId] = defaultDependencies,
+    version: Timestamp = defaultVersion) extends MarathonState[GroupDefinition, Group] {
 
   override def mergeFromProto(msg: GroupDefinition): Group = Group.fromProto(msg)
   override def mergeFromProto(bytes: Array[Byte]): Group = Group.fromProto(GroupDefinition.parseFrom(bytes))
@@ -47,14 +47,10 @@ case class Group(
     }
   }
 
-  def updateApp(path: PathId, fn: AppDefinition => AppDefinition, timestamp: Timestamp): Group = {
+  def updateApp(path: PathId, fn: Option[AppDefinition] => AppDefinition, timestamp: Timestamp): Group = {
     val groupId = path.parent
     makeGroup(groupId).update(timestamp) { group =>
-      if (group.id == groupId) {
-        val current = group.apps.find(_.id == path).getOrElse(AppDefinition(path))
-        group.putApplication(fn(current))
-      }
-      else group
+      if (group.id == groupId) group.putApplication(fn(group.apps.find(_.id == path))) else group
     }
   }
 
@@ -76,12 +72,31 @@ case class Group(
     fn(this.copy(groups = in(groups.toList).toSet, version = timestamp))
   }
 
+  /** Removes the group with the given gid if it exists */
   def remove(gid: PathId, timestamp: Timestamp = Timestamp.now()): Group = {
     copy(groups = groups.filter(_.id != gid).map(_.remove(gid, timestamp)), version = timestamp)
   }
 
-  def putApplication(appDef: AppDefinition): Group = copy(apps = apps.filter(_.id != appDef.id) + appDef)
+  /**
+    * Add the given app definition to this group replacing any priorly existing app definition with the same ID.
+    *
+    * If a group exists with a conflicting ID which does not contain any app definition, replace that as well.
+    */
+  private def putApplication(appDef: AppDefinition): Group = {
+    copy(
+      // If there is a group with a conflicting id which contains no app definitions,
+      // replace it. Otherwise do not replace it. Validation will catch conflicting app/group IDs later.
+      groups = groups.filter { group => group.id != appDef.id || group.containsApps },
+      // replace potentially existing app definition
+      apps = apps.filter(_.id != appDef.id) + appDef
+    )
+  }
 
+  /**
+    * Remove the app with the given id if it is a direct child of this group.
+    *
+    * Use together with [[mesosphere.marathon.state.Group!.update(timestamp*]].
+    */
   def removeApplication(appId: PathId): Group = copy(apps = apps.filter(_.id != appId))
 
   def makeGroup(gid: PathId): Group = {
@@ -151,6 +166,19 @@ case class Group(
   def hasNonCyclicDependencies: Boolean = {
     !new CycleDetector[AppDefinition, DefaultEdge](dependencyGraph).detectCycles()
   }
+
+  /** @return true if and only if this group directly or indirectly contains app definitions. */
+  @JsonIgnore
+  def containsApps: Boolean = apps.nonEmpty || groups.exists(_.containsApps)
+
+  @JsonIgnore
+  def containsAppsOrGroups: Boolean = apps.nonEmpty || groups.nonEmpty
+
+  @JsonIgnore
+  def withNormalizedVersion: Group = copy(version = Timestamp(0))
+
+  @JsonIgnore
+  def withoutChildren: Group = copy(apps = Set.empty, groups = Set.empty)
 }
 
 object Group {
@@ -167,9 +195,9 @@ object Group {
     )
   }
 
-  def DefaultApps: Set[AppDefinition] = Set.empty
-  def DefaultGroups: Set[Group] = Set.empty
-  def DefaultDependencies: Set[PathId] = Set.empty
-  def DefaultVersion: Timestamp = Timestamp.now()
+  def defaultApps: Set[AppDefinition] = Set.empty
+  def defaultGroups: Set[Group] = Set.empty
+  def defaultDependencies: Set[PathId] = Set.empty
+  def defaultVersion: Timestamp = Timestamp.now()
 }
 

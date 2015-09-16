@@ -1,21 +1,18 @@
 package mesosphere.marathon
 
-import mesosphere.chaos.http.HttpConf
-import org.apache.mesos.Protos.{ FrameworkID, FrameworkInfo, Credential }
-import org.apache.mesos.{ SchedulerDriver, MesosSchedulerDriver }
+import java.io.{ IOException, FileInputStream }
 
 import com.google.protobuf.ByteString
-import java.io.{ FileInputStream, IOException }
+import mesosphere.chaos.http.HttpConf
+import org.apache.mesos.Protos.{ Credential, FrameworkInfo, FrameworkID }
+import org.apache.mesos.{ MesosSchedulerDriver, SchedulerDriver }
+import org.slf4j.LoggerFactory
 
-/**
-  * Wrapper class for the scheduler
-  */
 object MarathonSchedulerDriver {
+  private[this] val log = LoggerFactory.getLogger(getClass)
 
-  var driver: Option[SchedulerDriver] = None
-
-  var scheduler: Option[MarathonScheduler] = None
-
+  //TODO: fix style issue and enable this scalastyle check
+  //scalastyle:off method.length
   def newDriver(config: MarathonConf,
                 httpConfig: HttpConf,
                 newScheduler: MarathonScheduler,
@@ -68,6 +65,8 @@ object MarathonSchedulerDriver {
 
     val frameworkInfo = frameworkInfoBuilder.build()
 
+    log.debug("Start creating new driver")
+
     val newDriver: MesosSchedulerDriver = credential match {
       case Some(cred) =>
         new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster(), cred)
@@ -76,8 +75,8 @@ object MarathonSchedulerDriver {
         new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster())
     }
 
-    driver = Some(newDriver)
-    scheduler = Some(newScheduler)
+    log.debug("Finished creating new driver", newDriver)
+
     newDriver
   }
 }

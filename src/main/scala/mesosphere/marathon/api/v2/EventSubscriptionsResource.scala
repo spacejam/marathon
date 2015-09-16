@@ -7,15 +7,17 @@ import javax.ws.rs.core.{ Context, MediaType, Response }
 import com.codahale.metrics.annotation.Timed
 import com.google.inject.Inject
 
-import mesosphere.marathon.api.RestResource
+import mesosphere.marathon.api.{ MarathonMediaType, RestResource }
 import mesosphere.marathon.event.http.HttpCallbackSubscriptionService
 import mesosphere.marathon.event.{ Subscribe, Unsubscribe }
 import mesosphere.marathon.{ BadRequestException, MarathonConf }
 
 @Path("v2/eventSubscriptions")
-@Produces(Array(MediaType.APPLICATION_JSON))
+@Produces(Array(MarathonMediaType.PREFERRED_APPLICATION_JSON))
 @Consumes(Array(MediaType.APPLICATION_JSON))
 class EventSubscriptionsResource @Inject() (val config: MarathonConf) extends RestResource {
+
+  //scalastyle:off null
 
   @Inject(optional = true) val service: HttpCallbackSubscriptionService = null
 

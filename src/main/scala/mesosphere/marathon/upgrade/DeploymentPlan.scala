@@ -4,12 +4,13 @@ import java.net.URL
 import java.util.UUID
 
 import mesosphere.marathon.Protos
+import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.state._
-import mesosphere.util.Logging
+import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
-import scala.collection.immutable.Seq
 import scala.collection.SortedMap
+import scala.collection.immutable.Seq
 
 sealed trait DeploymentAction {
   def app: AppDefinition
@@ -18,8 +19,10 @@ sealed trait DeploymentAction {
 // application has not been started before
 final case class StartApplication(app: AppDefinition, scaleTo: Int) extends DeploymentAction
 
-// application is started, but more instances should be started
-final case class ScaleApplication(app: AppDefinition, scaleTo: Int) extends DeploymentAction
+// application is started, but the instance count should be changed
+final case class ScaleApplication(app: AppDefinition,
+                                  scaleTo: Int,
+                                  sentencedToDeath: Option[Set[MarathonTask]] = None) extends DeploymentAction
 
 // application is started, but shall be completely stopped
 final case class StopApplication(app: AppDefinition) extends DeploymentAction
@@ -42,13 +45,13 @@ final case class DeploymentStep(actions: Seq[DeploymentAction]) {
 }
 
 /**
-  * A deployment plan consists of the [[DeploymentStep]]s necessary to
+  * A deployment plan consists of the [[mesosphere.marathon.upgrade.DeploymentStep]]s necessary to
   * change the group state from original to target.
   *
   * The steps are executed sequentially after each other. The actions within a
   * step maybe executed in parallel.
   *
-  * See [[mesosphere.marathon.upgrade.DeploymentPlan.appsGroupedByLongestPath]] to
+  * See `mesosphere.marathon.upgrade.DeploymentPlan.appsGroupedByLongestPath` to
   * understand how we can guarantee that all dependencies for a step are fulfilled
   * by prior steps.
   */
@@ -59,23 +62,30 @@ final case class DeploymentPlan(
     steps: Seq[DeploymentStep],
     version: Timestamp) extends MarathonState[Protos.DeploymentPlanDefinition, DeploymentPlan] {
 
+  /**
+    * Reverts this plan by applying the reverse changes to the given Group.
+    */
+  def revert(group: Group): Group = DeploymentPlanReverter.revert(original, target)(group)
+
   def isEmpty: Boolean = steps.isEmpty
 
   def nonEmpty: Boolean = !isEmpty
 
+  /** @return all ids of apps which are referenced in any deployment actions */
   def affectedApplicationIds: Set[PathId] = steps.flatMap(_.actions.map(_.app.id)).toSet
 
   def isAffectedBy(other: DeploymentPlan): Boolean =
+    // FIXME: check for group change conflicts?
     affectedApplicationIds.intersect(other.affectedApplicationIds).nonEmpty
 
   override def toString: String = {
     def appString(app: AppDefinition): String = s"App(${app.id}, ${app.cmd}))"
     def actionString(a: DeploymentAction): String = a match {
-      case StartApplication(app, scale) => s"Start(${appString(app)}, $scale)"
-      case StopApplication(app)         => s"Stop(${appString(app)})"
-      case ScaleApplication(app, scale) => s"Scale(${appString(app)}, $scale)"
-      case RestartApplication(app)      => s"Restart(${appString(app)})"
-      case ResolveArtifacts(app, urls)  => s"Resolve(${appString(app)}, $urls})"
+      case StartApplication(app, scale)         => s"Start(${appString(app)}, $scale)"
+      case StopApplication(app)                 => s"Stop(${appString(app)})"
+      case ScaleApplication(app, scale, toKill) => s"Scale(${appString(app)}, $scale, $toKill})"
+      case RestartApplication(app)              => s"Restart(${appString(app)})"
+      case ResolveArtifacts(app, urls)          => s"Resolve(${appString(app)}, $urls})"
     }
     val stepString = steps.map("Step(" + _.actions.map(actionString) + ")").mkString("(", ", ", ")")
     s"DeploymentPlan($version, $stepString)"
@@ -100,7 +110,9 @@ final case class DeploymentPlan(
       .build()
 }
 
-object DeploymentPlan extends Logging {
+object DeploymentPlan {
+  private val log = LoggerFactory.getLogger(getClass)
+
   def empty: DeploymentPlan =
     DeploymentPlan(UUID.randomUUID().toString, Group.empty, Group.empty, Nil, Timestamp.now())
 
@@ -163,7 +175,8 @@ object DeploymentPlan extends Logging {
     * Returns a sequence of deployment steps, the order of which is derived
     * from the topology of the target group's dependency graph.
     */
-  def dependencyOrderedSteps(original: Group, target: Group): Seq[DeploymentStep] = {
+  def dependencyOrderedSteps(original: Group, target: Group,
+                             toKill: Map[PathId, Set[MarathonTask]]): Seq[DeploymentStep] = {
     val originalApps: Map[PathId, AppDefinition] =
       original.transitiveApps.map(app => app.id -> app).toMap
 
@@ -178,7 +191,7 @@ object DeploymentPlan extends Logging {
 
           // Scale-only change.
           case Some(oldApp) if oldApp.isOnlyScaleChange(newApp) =>
-            Some(ScaleApplication(newApp, newApp.instances))
+            Some(ScaleApplication(newApp, newApp.instances, toKill.get(newApp.id)))
 
           // Update existing app.
           case Some(oldApp) if oldApp.isUpgrade(newApp) =>
@@ -194,11 +207,13 @@ object DeploymentPlan extends Logging {
     }.to[Seq]
   }
 
+  //scalastyle:off method.length
   def apply(
     original: Group,
     target: Group,
     resolveArtifacts: Seq[ResolveArtifacts] = Seq.empty,
-    version: Timestamp = Timestamp.now()): DeploymentPlan = {
+    version: Timestamp = Timestamp.now(),
+    toKill: Map[PathId, Set[MarathonTask]] = Map.empty): DeploymentPlan = {
     log.info(s"Compute DeploymentPlan from $original to $target")
 
     // Lookup maps for original and target apps.
@@ -242,14 +257,14 @@ object DeploymentPlan extends Logging {
     //            the old app or the new app, whichever is less.
     //         ii. Restart the app, up to the new target number of instances.
     //
-    steps ++= dependencyOrderedSteps(original, target)
+    steps ++= dependencyOrderedSteps(original, target, toKill)
 
     // Build the result.
     val result = DeploymentPlan(
       UUID.randomUUID().toString,
       original,
       target,
-      steps.result.filter(_.actions.nonEmpty),
+      steps.result().filter(_.actions.nonEmpty),
       version
     )
 

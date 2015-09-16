@@ -5,16 +5,16 @@ import akka.event.EventStream
 import akka.testkit.EventFilter
 import com.codahale.metrics.MetricRegistry
 import com.typesafe.config.ConfigFactory
-import mesosphere.marathon.{ MarathonConf, MarathonSpec }
+import mesosphere.marathon.metrics.Metrics
+import mesosphere.marathon.{ MarathonScheduler, MarathonSchedulerDriverHolder, MarathonConf, MarathonSpec }
 import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.state.{ AppDefinition, AppRepository, MarathonStore, PathId, Timestamp }
 import mesosphere.marathon.state.PathId.StringPathId
 import mesosphere.marathon.tasks.{ TaskIdUtil, TaskTracker }
 import mesosphere.util.Logging
-import org.apache.mesos.state.InMemoryState
+import mesosphere.util.state.memory.InMemoryStore
 import org.apache.mesos.{ Protos => mesos }
-import org.mockito.Mockito._
 import org.rogach.scallop.ScallopConf
 
 import scala.concurrent.Await
@@ -29,7 +29,7 @@ class MarathonHealthCheckManagerTest extends MarathonSpec with Logging {
   implicit var system: ActorSystem = _
 
   before {
-    val registry = new MetricRegistry
+    val metrics = new Metrics(new MetricRegistry)
 
     system = ActorSystem(
       "test-system",
@@ -40,14 +40,16 @@ class MarathonHealthCheckManagerTest extends MarathonSpec with Logging {
 
     val config = new ScallopConf(Seq("--master", "foo")) with MarathonConf
     config.afterInit()
-    taskTracker = new TaskTracker(new InMemoryState, defaultConfig(), registry)
+    taskTracker = new TaskTracker(new InMemoryStore, defaultConfig(), metrics)
     appRepository = new AppRepository(
-      new MarathonStore[AppDefinition](config, new InMemoryState, registry, () => AppDefinition()),
+      new MarathonStore[AppDefinition](new InMemoryStore, metrics, () => AppDefinition()),
       None,
-      registry)
+      metrics)
 
     hcManager = new MarathonHealthCheckManager(
       system,
+      mock[MarathonScheduler],
+      new MarathonSchedulerDriverHolder,
       mock[EventStream],
       taskTracker,
       appRepository

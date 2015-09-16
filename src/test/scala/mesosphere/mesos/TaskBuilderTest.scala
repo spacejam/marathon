@@ -3,20 +3,20 @@ package mesosphere.mesos
 import com.google.common.collect.Lists
 import mesosphere.marathon.MarathonSpec
 import mesosphere.marathon.Protos.{ Constraint, MarathonTask }
-import mesosphere.marathon.state.PathId._
-import mesosphere.marathon.state.{ AppDefinition, Container, PathId, Timestamp }
 import mesosphere.marathon.state.Container.Docker
 import mesosphere.marathon.state.Container.Docker.PortMapping
+import mesosphere.marathon.state.PathId._
+import mesosphere.marathon.state.{ AppDefinition, Container, PathId, Timestamp }
 import mesosphere.marathon.tasks.{ MarathonTasks, TaskTracker }
-import mesosphere.mesos.protos._
-import org.apache.mesos.Protos.{ Offer, TaskInfo }
+import mesosphere.mesos.protos.{ Resource, TaskID, _ }
 import org.apache.mesos.Protos.ContainerInfo.DockerInfo.Network
+import org.apache.mesos.Protos.{ Offer, _ }
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 
-import scala.collection.immutable.Seq
 import scala.collection.JavaConverters._
+import scala.collection.immutable.Seq
 
 class TaskBuilderTest extends MarathonSpec {
 
@@ -34,9 +34,9 @@ class TaskBuilderTest extends MarathonSpec {
       AppDefinition(
         id = "/product/frontend".toPath,
         cmd = Some("foo"),
-        cpus = 1,
-        mem = 64,
-        disk = 1,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
         executor = "//cmd",
         ports = Seq(8080, 8081)
       )
@@ -45,44 +45,131 @@ class TaskBuilderTest extends MarathonSpec {
     assert(task.isDefined)
 
     val (taskInfo, taskPorts) = task.get
-    val range = taskInfo.getResourcesList.asScala
-      .find(r => r.getName == Resource.PORTS)
-      .map(r => r.getRanges.getRange(0))
-    assert(range.isDefined)
-    // The taskName is the elements of the path, reversed, and joined by dots
-    assert("frontend.product" == taskInfo.getName)
-    assert(2 == taskPorts.size)
-    assert(taskPorts(0) == range.get.getBegin.toInt)
-    assert(taskPorts(1) == range.get.getEnd.toInt)
+    assertTaskInfo(taskInfo, taskPorts, offer)
 
-    assert(!taskInfo.hasExecutor)
-    assert(taskInfo.hasCommand)
-    val cmd = taskInfo.getCommand
-    assert(cmd.getShell)
-    assert(cmd.hasValue)
-    assert(cmd.getArgumentsList.asScala.isEmpty)
-    assert(cmd.getValue == "foo")
+    assert(!taskInfo.hasLabels)
+  }
 
-    assert(cmd.hasEnvironment)
-    val envVars = cmd.getEnvironment.getVariablesList.asScala
-    assert(envVars.exists(v => v.getName == "HOST" && v.getValue == offer.getHostname))
-    assert(envVars.exists(v => v.getName == "PORT0" && v.getValue.nonEmpty))
-    assert(envVars.exists(v => v.getName == "PORT1" && v.getValue.nonEmpty))
-    assert(envVars.exists(v => v.getName == "PORT_8080" && v.getValue.nonEmpty))
-    assert(envVars.exists(v => v.getName == "PORT_8081" && v.getValue.nonEmpty))
+  test("build creates task with appropriate resource share") {
+    val offer = makeBasicOffer(cpus = 2.0, mem = 128.0, disk = 2000.0, beginPort = 31000, endPort = 32000).build
 
-    val exposesFirstPort =
-      envVars.find(v => v.getName == "PORT0").get.getValue == envVars.find(v => v.getName == "PORT_8080").get.getValue
-    assert(exposesFirstPort)
-    val exposesSecondPort =
-      envVars.find(v => v.getName == "PORT1").get.getValue == envVars.find(v => v.getName == "PORT_8081").get.getValue
-    assert(exposesSecondPort)
+    val task: Option[(TaskInfo, Seq[Long])] = buildIfMatches(
+      offer,
+      AppDefinition(
+        id = "/product/frontend".toPath,
+        cmd = Some("foo"),
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
+        executor = "//cmd",
+        ports = Seq(8080, 8081)
+      )
+    )
 
-    for (r <- taskInfo.getResourcesList.asScala) {
-      assert("*" == r.getRole)
-    }
+    val Some((taskInfo, _)) = task
 
-    // TODO test for resources etc.
+    def resource(name: String): Resource = taskInfo.getResourcesList.asScala.find(_.getName == name).get
+
+    assert(resource("cpus") == ScalarResource("cpus", 1))
+    assert(resource("mem") == ScalarResource("mem", 64))
+    assert(resource("disk") == ScalarResource("disk", 1))
+    val portsResource: Resource = resource("ports")
+    assert(portsResource.getRanges.getRangeCount == 1)
+    val range: Value.Range = portsResource.getRanges.getRange(0)
+    assert(range.getEnd - range.getBegin == 1) // inclusive range contains two ports
+    assert(portsResource.getRole == "*")
+  }
+
+  // #1583 Do not pass zero disk resource shares to Mesos
+  test("build does set disk resource to zero in TaskInfo") {
+    val offer = makeBasicOffer(cpus = 2.0, mem = 128.0, disk = 2000.0, beginPort = 31000, endPort = 32000).build
+
+    val task: Option[(TaskInfo, Seq[Long])] = buildIfMatches(
+      offer,
+      AppDefinition(
+        id = "/product/frontend".toPath,
+        cmd = Some("foo"),
+        disk = 0.0
+      )
+    )
+
+    val Some((taskInfo, _)) = task
+
+    def resourceOpt(name: String) = taskInfo.getResourcesList.asScala.find(_.getName == name)
+
+    assert(resourceOpt("disk") == None)
+  }
+
+  test("build creates task with appropriate resource share also preserves role") {
+    val offer = makeBasicOffer(
+      cpus = 2.0, mem = 128.0, disk = 2000.0, beginPort = 31000, endPort = 32000, role = "marathon"
+    ).build
+
+    val task: Option[(TaskInfo, Seq[Long])] = buildIfMatches(
+      offer,
+      AppDefinition(
+        id = "/product/frontend".toPath,
+        cmd = Some("foo"),
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
+        executor = "//cmd",
+        ports = Seq(8080, 8081)
+      ),
+      mesosRole = Some("marathon"),
+      acceptedResourceRoles = Some(Set("*", "marathon"))
+    )
+
+    val Some((taskInfo, _)) = task
+
+    def resource(name: String): Resource = taskInfo.getResourcesList.asScala.find(_.getName == name).get
+
+    assert(resource("cpus") == ScalarResource("cpus", 1, "marathon"))
+    assert(resource("mem") == ScalarResource("mem", 64, "marathon"))
+    assert(resource("disk") == ScalarResource("disk", 1, "marathon"))
+    val portsResource: Resource = resource("ports")
+    assert(portsResource.getRanges.getRangeCount == 1)
+    val range: Value.Range = portsResource.getRanges.getRange(0)
+    assert(range.getEnd - range.getBegin == 1) // inclusive range contains two ports
+    assert(portsResource.getRole == "marathon")
+  }
+
+  test("BuildIfMatchesWithLabels") {
+    val offer = makeBasicOffer(cpus = 1.0, mem = 128.0, disk = 2000.0, beginPort = 31000, endPort = 32000)
+      .addResources(ScalarResource("cpus", 1))
+      .addResources(ScalarResource("mem", 128))
+      .addResources(ScalarResource("disk", 2000))
+      .build
+
+    val labels = Map("foo" -> "bar", "test" -> "test")
+
+    val task: Option[(TaskInfo, Seq[Long])] = buildIfMatches(
+      offer,
+      AppDefinition(
+        id = "/product/frontend".toPath,
+        cmd = Some("foo"),
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
+        executor = "//cmd",
+        ports = Seq(8080, 8081),
+        labels = labels
+      )
+    )
+
+    assert(task.isDefined)
+
+    val (taskInfo, taskPorts) = task.get
+    assertTaskInfo(taskInfo, taskPorts, offer)
+
+    val expectedLabels = Labels.newBuilder.addAllLabels(
+      labels.map {
+        case (key, value) =>
+          Label.newBuilder.setKey(key).setValue(value).build()
+      }.asJava
+    ).build()
+    assert(taskInfo.hasLabels)
+    assert(taskInfo.getLabels == expectedLabels)
   }
 
   test("BuildIfMatchesWithArgs") {
@@ -97,9 +184,9 @@ class TaskBuilderTest extends MarathonSpec {
       AppDefinition(
         id = "testApp".toPath,
         args = Some(Seq("a", "b", "c")),
-        cpus = 1,
-        mem = 64,
-        disk = 1,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
         executor = "//cmd",
         ports = Seq(8080, 8081)
       )
@@ -113,14 +200,14 @@ class TaskBuilderTest extends MarathonSpec {
       .map(r => r.getRanges.getRange(0))
     assert(range.isDefined)
     assert(2 == taskPorts.size)
-    assert(taskPorts(0) == range.get.getBegin.toInt)
+    assert(taskPorts.head == range.get.getBegin.toInt)
     assert(taskPorts(1) == range.get.getEnd.toInt)
 
     assert(!taskInfo.hasExecutor)
     assert(taskInfo.hasCommand)
     val cmd = taskInfo.getCommand
     assert(!cmd.getShell)
-    assert(!cmd.hasValue)
+    assert(cmd.hasValue)
     assert(cmd.getArgumentsList.asScala == Seq("a", "b", "c"))
 
     for (r <- taskInfo.getResourcesList.asScala) {
@@ -129,6 +216,7 @@ class TaskBuilderTest extends MarathonSpec {
 
     // TODO test for resources etc.
   }
+
   test("BuildIfMatchesWithCommandAndExecutor") {
     val offer = makeBasicOffer(cpus = 1.0, mem = 128.0, disk = 2000.0, beginPort = 31000, endPort = 32000)
       .addResources(ScalarResource("cpus", 1))
@@ -140,9 +228,9 @@ class TaskBuilderTest extends MarathonSpec {
       offer,
       AppDefinition(
         id = "testApp".toPath,
-        cpus = 1,
-        mem = 64,
-        disk = 1,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
         cmd = Some("foo"),
         executor = "/custom/executor",
         ports = Seq(8080, 8081)
@@ -151,7 +239,7 @@ class TaskBuilderTest extends MarathonSpec {
 
     assert(task.isDefined)
 
-    val (taskInfo, taskPorts) = task.get
+    val (taskInfo, _) = task.get
     assert(taskInfo.hasExecutor)
     assert(!taskInfo.hasCommand)
 
@@ -173,9 +261,9 @@ class TaskBuilderTest extends MarathonSpec {
       offer,
       AppDefinition(
         id = "testApp".toPath,
-        cpus = 1,
-        mem = 64,
-        disk = 1,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
         args = Some(Seq("a", "b", "c")),
         executor = "/custom/executor",
         ports = Seq(8080, 8081)
@@ -184,7 +272,7 @@ class TaskBuilderTest extends MarathonSpec {
 
     assert(task.isDefined)
 
-    val (taskInfo, taskPorts) = task.get
+    val (taskInfo, _) = task.get
     val cmd = taskInfo.getExecutor.getCommand
 
     assert(!taskInfo.hasCommand)
@@ -206,12 +294,13 @@ class TaskBuilderTest extends MarathonSpec {
       offer,
       AppDefinition(
         id = "testApp".toPath,
-        cpus = 2,
-        mem = 200,
-        disk = 2,
+        cpus = 2.0,
+        mem = 200.0,
+        disk = 2.0,
         executor = "//cmd",
         ports = Seq(8080, 8081)
-      )
+      ),
+      mesosRole = Some("marathon")
     )
 
     assert(task.isDefined)
@@ -222,7 +311,7 @@ class TaskBuilderTest extends MarathonSpec {
       .map(r => r.getRanges.getRange(0))
     assert(range.isDefined)
     assert(2 == taskPorts.size)
-    assert(taskPorts(0) == range.get.getBegin.toInt)
+    assert(taskPorts.head == range.get.getBegin.toInt)
     assert(taskPorts(1) == range.get.getEnd.toInt)
 
     for (r <- taskInfo.getResourcesList.asScala) {
@@ -247,9 +336,9 @@ class TaskBuilderTest extends MarathonSpec {
       offer,
       AppDefinition(
         id = "testApp".toPath,
-        cpus = 1,
-        mem = 64,
-        disk = 1,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
         executor = "//cmd",
         ports = Seq(8080, 8081)
       )
@@ -263,7 +352,7 @@ class TaskBuilderTest extends MarathonSpec {
       .map(r => r.getRanges.getRange(0))
     assert(range.isDefined)
     assert(2 == taskPorts.size)
-    assert(taskPorts(0) == range.get.getBegin.toInt)
+    assert(taskPorts.head == range.get.getBegin.toInt)
     assert(taskPorts(1) == range.get.getEnd.toInt)
 
     // In this case, the first roles are sufficient so we'll use those first.
@@ -272,6 +361,41 @@ class TaskBuilderTest extends MarathonSpec {
     }
 
     // TODO test for resources etc.
+  }
+
+  test("PortMappingsWithZeroContainerPort") {
+    val offer = makeBasicOfferWithRole(
+      cpus = 1.0, mem = 128.0, disk = 1000.0, beginPort = 31000, endPort = 31000, role = "*"
+    )
+      .addResources(ScalarResource("cpus", 1, "*"))
+      .addResources(ScalarResource("mem", 128, "*"))
+      .addResources(ScalarResource("disk", 1000, "*"))
+      .addResources(RangesResource(Resource.PORTS, Seq(protos.Range(33000, 34000)), "marathon"))
+      .build
+
+    val task: Option[(TaskInfo, Seq[Long])] = buildIfMatches(
+      offer, AppDefinition(
+        id = "testApp".toPath,
+        cpus = 1.0,
+        mem = 64.0,
+        disk = 1.0,
+        executor = "//cmd",
+        container = Some(Container(
+          docker = Some(Docker(
+            network = Some(Network.BRIDGE),
+            portMappings = Some(Seq(
+              PortMapping(containerPort = 0, hostPort = 0, servicePort = 9000, protocol = "tcp")
+            ))
+          ))
+        ))
+      )
+    )
+    assert(task.isDefined)
+    val (taskInfo, _) = task.get
+    val hostPort = taskInfo.getContainer.getDocker.getPortMappings(0).getHostPort
+    assert(hostPort == 31000)
+    val containerPort = taskInfo.getContainer.getDocker.getPortMappings(0).getContainerPort
+    assert(containerPort == hostPort)
   }
 
   test("BuildIfMatchesWithRackIdConstraint") {
@@ -333,7 +457,7 @@ class TaskBuilderTest extends MarathonSpec {
         offer.getHostname,
         tupleOption.get._2,
         offer.getAttributesList.asScala.toList,
-        Timestamp.now)
+        Timestamp.now())
       runningTasks += marathonTask
     }
 
@@ -393,7 +517,7 @@ class TaskBuilderTest extends MarathonSpec {
         tupleOption.get._1.getTaskId.getValue,
         offer.getHostname,
         tupleOption.get._2,
-        offer.getAttributesList.asScala.toList, Timestamp.now)
+        offer.getAttributesList.asScala.toList, Timestamp.now())
       runningTasks += marathonTask
     }
 
@@ -441,17 +565,18 @@ class TaskBuilderTest extends MarathonSpec {
   test("AppContextEnvironment") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "/test".toPath,
           ports = Seq(8080, 8081),
           version = Timestamp(0)
         ),
-        Some(TaskID("task-123")),
-        Some ("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
-      command.getEnvironment().getVariablesList().asScala.toList.map(v => v.getName() -> v.getValue()).toMap
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
 
     assert("task-123" == env("MESOS_TASK_ID"))
     assert("/test" == env("MARATHON_APP_ID"))
@@ -464,7 +589,7 @@ class TaskBuilderTest extends MarathonSpec {
 
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "/test".toPath,
           ports = Seq(8080, 8081),
           version = Timestamp(0),
@@ -477,12 +602,13 @@ class TaskBuilderTest extends MarathonSpec {
             "PORT_8081" -> "port8081"
           )
         ),
-        Some(TaskID("task-123")),
-        Some ("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
-      command.getEnvironment().getVariablesList().asScala.toList.map(v => v.getName() -> v.getValue()).toMap
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
 
     assert("1" == env("PORT"))
     assert("ports" == env("PORTS"))
@@ -495,24 +621,75 @@ class TaskBuilderTest extends MarathonSpec {
   test("PortsEnvWithOnlyPorts") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           ports = Seq(8080, 8081)
         ),
-        Some(TaskID("task-123")),
-        Some ("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
-      command.getEnvironment().getVariablesList().asScala.toList.map(v => v.getName() -> v.getValue()).toMap
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
 
     assert("1000" == env("PORT_8080"))
     assert("1001" == env("PORT_8081"))
   }
 
-  test("PortsEnvWithOnlyMappings") {
+  test("PortsEnvWithCustomPrefix") {
     val command =
       TaskBuilder.commandInfo(
         AppDefinition(
+          ports = Seq(8080, 8081)
+        ),
+        Some(TaskID("task-123")),
+        Some("host.mega.corp"),
+        Seq(1000, 1001),
+        Some("CUSTOM_PREFIX_")
+      )
+    val env: Map[String, String] =
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
+
+    assert("1000,1001" == env("CUSTOM_PREFIX_PORTS"))
+
+    assert("1000" == env("CUSTOM_PREFIX_PORT"))
+
+    assert("1000" == env("CUSTOM_PREFIX_PORT0"))
+    assert("1000" == env("CUSTOM_PREFIX_PORT_8080"))
+
+    assert("1001" == env("CUSTOM_PREFIX_PORT1"))
+    assert("1001" == env("CUSTOM_PREFIX_PORT_8081"))
+
+    assert("host.mega.corp" == env("CUSTOM_PREFIX_HOST"))
+
+    assert(Seq("HOST", "PORTS", "PORT0", "PORT1").forall(k => !env.contains(k)))
+    assert(Seq("MESOS_TASK_ID", "MARATHON_APP_ID", "MARATHON_APP_VERSION").forall(env.contains))
+  }
+
+  test("OnlyWhitelistedUnprefixedVariablesWithCustomPrefix") {
+    val command =
+      TaskBuilder.commandInfo(
+        AppDefinition(
+          ports = Seq(8080, 8081)
+        ),
+        Some(TaskID("task-123")),
+        Some("host.mega.corp"),
+        Seq(1000, 1001),
+        Some("P_")
+      )
+    val env: Map[String, String] =
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
+
+    val nonPrefixedEnvVars = env.filterKeys(!_.startsWith("P_"))
+    val whiteList = Seq("MESOS_TASK_ID", "MARATHON_APP_ID", "MARATHON_APP_VERSION")
+
+    assert(nonPrefixedEnvVars.keySet.forall(whiteList.contains))
+  }
+
+  test("PortsEnvWithOnlyMappings") {
+    val command =
+      TaskBuilder.commandInfo(
+        app = AppDefinition(
           container = Some(Container(
             docker = Some(Docker(
               network = Some(Network.BRIDGE),
@@ -523,12 +700,13 @@ class TaskBuilderTest extends MarathonSpec {
             ))
           ))
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
-      command.getEnvironment().getVariablesList().asScala.toList.map(v => v.getName() -> v.getValue()).toMap
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
 
     assert("1000" == env("PORT_8080"))
     assert("1001" == env("PORT_8081"))
@@ -537,7 +715,7 @@ class TaskBuilderTest extends MarathonSpec {
   test("PortsEnvWithBothPortsAndMappings") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           ports = Seq(22, 23),
           container = Some(Container(
             docker = Some(Docker(
@@ -549,12 +727,13 @@ class TaskBuilderTest extends MarathonSpec {
             ))
           ))
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
-      command.getEnvironment().getVariablesList().asScala.toList.map(v => v.getName() -> v.getValue()).toMap
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
 
     assert("1000" == env("PORT_8080"))
     assert("1001" == env("PORT_8081"))
@@ -567,19 +746,19 @@ class TaskBuilderTest extends MarathonSpec {
 
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "testApp".toPath,
-          cpus = 1,
-          mem = 64,
-          disk = 1,
+          cpus = 1.0,
+          mem = 64.0,
+          disk = 1.0,
           executor = "//cmd",
-          uris = Seq("http://www.example.com", "http://www.example.com/test.tgz",
-            "example.tar.gz"),
+          uris = Seq("http://www.example.com", "http://www.example.com/test.tgz", "example.tar.gz"),
           ports = Seq(8080, 8081)
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
 
     val uriinfo1 = command.getUris(0)
@@ -591,11 +770,20 @@ class TaskBuilderTest extends MarathonSpec {
 
   }
 
-  def buildIfMatches(offer: Offer, app: AppDefinition) = {
+  def buildIfMatches(
+    offer: Offer,
+    app: AppDefinition,
+    mesosRole: Option[String] = None,
+    acceptedResourceRoles: Option[Set[String]] = None,
+    envVarsPrefix: Option[String] = None) = {
     val taskTracker = mock[TaskTracker]
 
     val builder = new TaskBuilder(app,
-      s => TaskID(s.toString), taskTracker, defaultConfig())
+      s => TaskID(s.toString), taskTracker,
+      defaultConfig(
+        mesosRole = mesosRole,
+        acceptedResourceRoles = acceptedResourceRoles,
+        envVarsPrefix = envVarsPrefix))
 
     builder.buildIfMatches(offer)
   }
@@ -607,5 +795,46 @@ class TaskBuilderTest extends MarathonSpec {
       .setId(id.toString)
       .addAttributes(TextAttribute(attr, attrVal))
       .build()
+  }
+
+  private def assertTaskInfo(taskInfo: TaskInfo, taskPorts: Seq[Long], offer: Offer): Unit = {
+    val range = taskInfo.getResourcesList.asScala
+      .find(r => r.getName == Resource.PORTS)
+      .map(r => r.getRanges.getRange(0))
+    assert(range.isDefined)
+    // The taskName is the elements of the path, reversed, and joined by dots
+    assert("frontend.product" == taskInfo.getName)
+    assert(2 == taskPorts.size)
+    assert(taskPorts.head == range.get.getBegin.toInt)
+    assert(taskPorts(1) == range.get.getEnd.toInt)
+
+    assert(!taskInfo.hasExecutor)
+    assert(taskInfo.hasCommand)
+    val cmd = taskInfo.getCommand
+    assert(cmd.getShell)
+    assert(cmd.hasValue)
+    assert(cmd.getArgumentsList.asScala.isEmpty)
+    assert(cmd.getValue == "foo")
+
+    assert(cmd.hasEnvironment)
+    val envVars = cmd.getEnvironment.getVariablesList.asScala
+    assert(envVars.exists(v => v.getName == "HOST" && v.getValue == offer.getHostname))
+    assert(envVars.exists(v => v.getName == "PORT0" && v.getValue.nonEmpty))
+    assert(envVars.exists(v => v.getName == "PORT1" && v.getValue.nonEmpty))
+    assert(envVars.exists(v => v.getName == "PORT_8080" && v.getValue.nonEmpty))
+    assert(envVars.exists(v => v.getName == "PORT_8081" && v.getValue.nonEmpty))
+
+    val exposesFirstPort =
+      envVars.find(v => v.getName == "PORT0").get.getValue == envVars.find(v => v.getName == "PORT_8080").get.getValue
+    assert(exposesFirstPort)
+    val exposesSecondPort =
+      envVars.find(v => v.getName == "PORT1").get.getValue == envVars.find(v => v.getName == "PORT_8081").get.getValue
+    assert(exposesSecondPort)
+
+    for (r <- taskInfo.getResourcesList.asScala) {
+      assert("*" == r.getRole)
+    }
+
+    // TODO test for resources etc.
   }
 }

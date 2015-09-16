@@ -31,13 +31,16 @@ title: REST API
   * [POST /v2/tasks/delete](#post-/v2/tasks/delete): Kill given list of tasks
 * [Deployments](#deployments) <span class="label label-default">v0.7.0</span>
   * [GET /v2/deployments](#get-/v2/deployments): List running deployments
-  * [DELETE /v2/deployments/{deploymentId}](#delete-/v2/deployments/{deploymentid}): Cancel the deployment with `deploymentId`
+  * [DELETE /v2/deployments/{deploymentId}](#delete-/v2/deployments/{deploymentid}): Revert or cancel the deployment with `deploymentId`
+* [Event Stream](#event-stream) <span class="label label-default">v0.9.0</span>
+  * [GET /v2/events](#get-/v2/events): Attach to the event stream
 * [Event Subscriptions](#event-subscriptions)
   * [POST /v2/eventSubscriptions](#post-/v2/eventsubscriptions): Register a callback URL as an event subscriber
   * [GET /v2/eventSubscriptions](#get-/v2/eventsubscriptions): List all event subscriber callback URLs
   * [DELETE /v2/eventSubscriptions](#delete-/v2/eventsubscriptions) Unregister a callback URL from the event subscribers list
 * [Queue](#queue) <span class="label label-default">v0.7.0</span>
   * [GET /v2/queue](#get-/v2/queue): List content of the staging queue.
+  * [DELETE /v2/queue/{appId}/delay](#delete-/v2/queue/{appId}/delay): <span class="label label-default">v0.10.0</span> Reset the application specific task launch delay.
 * [Server Info](#server-info) <span class="label label-default">v0.7.0</span>
   * [GET /v2/info](#get-/v2/info): Get info about the Marathon Instance
   * [GET /v2/leader](#get-/v2/leader): Get the current leader
@@ -56,7 +59,7 @@ Create and start a new application.
 
 The full JSON format of an application resource is as follows:
 
-{% highlight json %}
+{% highlight javascript %}
 {
     "id": "/product/service/my-app",
     "cmd": "env && sleep 300",
@@ -111,6 +114,9 @@ The full JSON format of an application resource is as follows:
     "executor": "",
     "constraints": [
         ["attribute", "OPERATOR", "value"]
+    ],
+    "acceptedResourceRoles": [ /* since 0.9.0 */
+        "role1", "*"
     ],
     "labels": {
         "environment": "staging"
@@ -195,6 +201,31 @@ Valid constraint operators are one of ["UNIQUE", "CLUSTER",
 "GROUP_BY"]. For additional information on using placement constraints see
 the [Constraints doc page]({{ site.baseurl }}/docs/constraints.html).
 
+##### acceptedResourceRoles <span class="label label-default">v0.9.0</span>
+
+Optional. A list of resource roles. Marathon considers only resource offers with roles in this list for launching
+tasks of this app. If you do not specify this, Marathon considers all resource offers with roles that have been
+configured by the `--default_accepted_resource_roles` command line flag. If no `--default_accepted_resource_roles` was
+given on startup, Marathon considers all resource offers.
+
+Example 1: `"acceptedResourceRoles": [ "production", "*" ]` Tasks of this app definition are launched either
+on "production" or "*" resources.
+
+Example 2: `"acceptedResourceRoles": [ "public" ]` Tasks of this app definition are launched only on "public"
+resources.
+
+Background: Mesos can assign roles to certain resource shares. Frameworks which are not explicitly registered for
+a role do not see resources of that role. In this way, you can reserve resources for frameworks. Resources not reserved
+for custom role, are available for all frameworks. Mesos assigns the special role "*" to them.
+
+To register Marathon for a role, you need to specify the `--mesos_role` command line flag on startup.
+If you want to assign all resources of a
+slave to a role, you can use the `--default_role` argument when starting up the slave. If you need a more
+fine-grained configuration, you can use the `--resources' argument to specify resource shares per role. The Mesos master
+needs to be started with `--roles` followed by a comma-separated list of all roles you want to use across your cluster.
+See
+[the Mesos command line documentation](http://mesos.apache.org/documentation/latest/configuration/) for details.
+
 ##### labels
 
 Attaching metadata to apps can be useful to expose additional information
@@ -238,7 +269,7 @@ An HTTP health check is considered passing if (1) its HTTP response code is betw
 200 and 399, inclusive, and (2) its response is received within the
 `timeoutSeconds` period.
 
-If a task fails more than `maxConseutiveFailures`
+If a task fails more than `maxConsecutiveFailures`
 health checks consecutively, that task is killed causing Marathon to start
 more instances. These restarts are modulated like any other failing app
 by `backoffSeconds`, `backoffFactor` and `maxLaunchDelaySeconds`.
@@ -276,12 +307,12 @@ The port array currently serves multiple roles:
   for every task.
 * For every port that is zero, a globally unique (cluster-wide) port is assigned and
   provided as part of the app definition to be used in load balancing definitions.
-  See [Service Discovery Load Balancing doc page]({{ site.baseurl }}/docs/service-discovery-load-balancing.md)
+  See [Service Discovery Load Balancing doc page]({{ site.baseurl }}/docs/service-discovery-load-balancing.html)
   for details.
 
 Since this is confusing, we recommend to configure ports assignment for docker
 containers in `container.docker.portMappings` instead, see
-[Docker Containers doc page]({{ site.baseurl }}/docs/native-docker.md#bridged-networking-mode)).
+[Docker Containers doc page]({{ site.baseurl }}/docs/native-docker.html#bridged-networking-mode)).
 
 Alternatively or if you use the Mesos Containerizer, pass zeros as port values to generate one or more arbitrary
 free ports for each application instance.
@@ -303,7 +334,7 @@ If you need more control and want to specify your host ports in advance, you can
 
  The specified ports need to be in the local port range specified by the
  `--local_port_min` and `--local_port_max` flags. See
- [Command Line Flags doc page]({{ site.baseurl }}/docs/command-line-flags.md)).
+ [Command Line Flags doc page]({{ site.baseurl }}/docs/command-line-flags.html)).
 
 ##### upgradeStrategy
 
@@ -1122,9 +1153,18 @@ User-Agent: HTTPie/0.7.2
 **Response:**
 
 {% highlight http %}
-HTTP/1.1 204 No Content
+HTTP/1.1 200 OK
+Cache-Control: no-cache, no-store, must-revalidate
 Content-Type: application/json
-Server: Jetty(8.y.z-SNAPSHOT)
+Expires: 0
+Pragma: no-cache
+Server: Jetty(8.1.15.v20140411)
+Transfer-Encoding: chunked
+
+{
+    "deploymentId": "14f48a7d-261e-4641-a158-8c5894c3116a",
+    "version": "2015-04-21T10:34:13.646Z"
+}
 {% endhighlight %}
 
 
@@ -2036,6 +2076,7 @@ HTTP/1.1 200 OK
 Content-Length: 0
 Content-Type: application/json
 Server: Jetty(8.y.z-SNAPSHOT)
+{% endhighlight %}
 
 ### Deployments
 
@@ -2108,8 +2149,9 @@ Transfer-Encoding: chunked
       <td><code>boolean</code></td>
       <td>
         If set to <code>false</code> (the default) then the deployment is
-        canceled and a new deployment is created to restore the previous
-        configuration.  If set to <code>true</code>, then the deployment
+        canceled and a new deployment is created to revert the changes of this
+        deployment. Without concurrent deployments, this restores the configuration before this
+        deployment. If set to <code>true</code>, then the deployment
         is still canceled but no rollback deployment is created.
         Default: <code>false</code>.</td>
     </tr>
@@ -2118,7 +2160,8 @@ Transfer-Encoding: chunked
 
 ##### Example
 
-Cancel the deployment with `deploymentId`
+Revert the deployment with `deploymentId` by creating a new deployment which reverses
+all changes.
 
 **Request:**
 
@@ -2147,7 +2190,7 @@ Transfer-Encoding: chunked
 
 ##### Example
 
-Cancel the deployment with `deploymendId`, and do not create a new rollback deployment.
+Cancel the deployment with `deploymentId`, and do not create a new rollback deployment.
 
 **Request:**
 
@@ -2168,6 +2211,52 @@ Content-Length: 0
 Content-Type: application/json
 Server: Jetty(8.y.z-SNAPSHOT)
 {% endhighlight %}
+
+
+### Event Stream
+
+#### GET `/v2/events`
+
+<span class="label label-default">v0.9.0</span>
+
+Attach to the marathon event stream.
+
+To use this endpoint, the client has to accept the text/event-stream content type.
+Please note: a request to this endpoint will not be closed by the server.
+If an event happens on the server side, this event will be propagated to the client immediately.
+See [Server Sent Events](http://www.w3schools.com/html/html5_serversentevents.asp) for a more detailed explanation.
+
+**Request:**
+
+```
+GET /v2/events HTTP/1.1
+Accept: text/event-stream
+Accept-Encoding: gzip, deflate
+Host: localhost:8080
+User-Agent: HTTPie/0.8.0
+```
+
+**Response:**
+
+```
+HTTP/1.1 200 OK
+Cache-Control: no-cache, no-store, must-revalidate
+Connection: close
+Content-Type: text/event-stream;charset=UTF-8
+Expires: 0
+Pragma: no-cache
+Server: Jetty(8.1.15.v20140411)
+
+```
+
+If an event happens on the server side, it is sent as plain json prepended with the mandatory `data:` field.
+
+**Response:**
+```
+data: {"remoteAddress":"96.23.11.158","eventType":"event_stream_attached","timestamp":"2015-04-28T12:14:57.812Z"}
+
+data: {"groupId":"/","version":"2015-04-28T12:24:12.098Z","eventType":"group_change_success","timestamp":"2015-04-28T12:24:12.224Z"}
+```
 
 ### Event Subscriptions
 
@@ -2340,7 +2429,8 @@ Transfer-Encoding: chunked
         {
             "count" : 10,
             "delay": {
-              "overdue": "true"
+              "overdue": "true",
+              "timeLeftSeconds": 784
             }
             "app" : {
                 "cmd" : "tail -f /dev/null",
@@ -2376,6 +2466,30 @@ Transfer-Encoding: chunked
         }
     ]
 }
+{% endhighlight %}
+
+#### DELETE `/v2/queue/{appId}/delay`
+
+The application specific task launch delay can be reset by calling this endpoint 
+
+##### Example
+
+{% highlight http %}
+DELETE /v2/queue/myapp/delay HTTP/1.1
+Accept: */*
+Accept-Encoding: gzip, deflate
+Connection: keep-alive
+Content-Length: 0
+Host: localhost:8080
+User-Agent: HTTPie/0.9.2
+{% endhighlight %}
+
+{% highlight http %}
+HTTP/1.1 204 No Content
+Cache-Control: no-cache, no-store, must-revalidate
+Expires: 0
+Pragma: no-cache
+Server: Jetty(8.1.15.v20140411)
 {% endhighlight %}
 
 ### Server Info
@@ -2438,13 +2552,9 @@ Server: Jetty(8.y.z-SNAPSHOT)
     "version": "0.7.0-SNAPSHOT",
     "zookeeper_config": {
         "zk": "zk://localhost:2181/marathon",
-        "zk_future_timeout": {
-            "duration": 10
-        },
-        "zk_hosts": "localhost:2181",
-        "zk_path": "/marathon",
-        "zk_state": "/marathon",
-        "zk_timeout": 10
+        "zk_timeout": 10000,
+        "zk_session_timeout": 1800000,
+        "zk_max_version": 5
     }
 }
 {% endhighlight %}

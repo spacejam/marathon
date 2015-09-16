@@ -1,25 +1,22 @@
 package mesosphere.mesos
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
 import java.io.ByteArrayOutputStream
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.google.protobuf.ByteString
-import org.apache.log4j.Logger
-import org.apache.mesos.Protos.Environment._
-import org.apache.mesos.Protos._
-
+import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon._
 import mesosphere.marathon.state.{ AppDefinition, PathId }
-import mesosphere.marathon.tasks.{ PortsMatcher, TaskTracker }
-import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
-import mesosphere.marathon.Protos.Constraint
+import mesosphere.marathon.health.HealthCheck
+import mesosphere.marathon.tasks.TaskTracker
+import mesosphere.mesos.ResourceMatcher.ResourceMatch
 import mesosphere.mesos.protos.{ RangesResource, Resource, ScalarResource }
+import org.apache.log4j.Logger
+import org.apache.mesos.Protos.Environment._
+import org.apache.mesos.Protos.{ HealthCheck => _, _ }
 
+import scala.collection.JavaConverters._
 import scala.collection.immutable.Seq
-import scala.util.{ Failure, Success, Try }
 
 class TaskBuilder(app: AppDefinition,
                   newTaskId: PathId => TaskID,
@@ -32,27 +29,64 @@ class TaskBuilder(app: AppDefinition,
   val log = Logger.getLogger(getClass.getName)
 
   def buildIfMatches(offer: Offer): Option[(TaskInfo, Seq[Long])] = {
-    var cpuRole = ""
-    var memRole = ""
-    var diskRole = ""
-    var portsResource: RangesResource = null
 
-    offerMatches(offer) match {
-      case Some((cpu, mem, disk, ranges)) =>
-        cpuRole = cpu
-        memRole = mem
-        diskRole = disk
-        portsResource = ranges
-      case _ =>
-        log.info(
-          s"No matching offer for ${app.id} (need cpus=${app.cpus}, mem=${app.mem}, " +
-            s"disk=${app.disk}, ports=${app.hostPorts}) : " + offer
-        )
-        return None
+    val acceptedResourceRoles: Set[String] = app.acceptedResourceRoles.getOrElse(config.defaultAcceptedResourceRolesSet)
+
+    if (log.isDebugEnabled) {
+      log.debug(s"acceptedResourceRoles $acceptedResourceRoles")
     }
 
+    ResourceMatcher.matchResources(
+      offer, app, taskTracker.get(app.id),
+      acceptedResourceRoles = acceptedResourceRoles) match {
+
+        case Some(ResourceMatch(cpu, mem, disk, ranges)) =>
+          build(offer, cpu, mem, disk, ranges)
+
+        case _ =>
+          def logInsufficientResources(): Unit = {
+            val appHostPorts = if (app.requirePorts) app.ports else app.ports.map(_ => 0)
+            val containerHostPorts: Option[Seq[Int]] = app.containerHostPorts
+            val hostPorts = containerHostPorts.getOrElse(appHostPorts)
+            val staticHostPorts = hostPorts.filter(_ != 0)
+            val numberDynamicHostPorts = hostPorts.count(_ == 0)
+
+            val maybeStatic: Option[String] = if (staticHostPorts.nonEmpty) {
+              Some(s"[${staticHostPorts.mkString(", ")}] required")
+            }
+            else {
+              None
+            }
+
+            val maybeDynamic: Option[String] = if (numberDynamicHostPorts > 0) {
+              Some(s"$numberDynamicHostPorts dynamic")
+            }
+            else {
+              None
+            }
+
+            val portStrings = Seq(maybeStatic, maybeDynamic).flatten.mkString(" + ")
+
+            val portsString = s"ports=($portStrings)"
+
+            log.info(
+              s"Offer [${offer.getId.getValue}]. Insufficient resources for [${app.id}] (need cpus=${app.cpus}, " +
+                s"mem=${app.mem}, disk=${app.disk}, $portsString, available in offer:\n" + offer
+            )
+          }
+
+          logInsufficientResources()
+          None
+      }
+  }
+
+  //TODO: fix style issue and enable this scalastyle check
+  //scalastyle:off cyclomatic.complexity method.length
+  private def build(offer: Offer, cpuRole: String, memRole: String, diskRole: String,
+                    portsResources: Seq[RangesResource]): Some[(TaskInfo, Seq[Long])] = {
+
     val executor: Executor = if (app.executor == "") {
-      Main.conf.executor
+      config.executor
     }
     else {
       Executor.dispatch(app.executor)
@@ -60,7 +94,12 @@ class TaskBuilder(app: AppDefinition,
 
     val host: Option[String] = Some(offer.getHostname)
 
-    val ports = portsResource.ranges.flatMap(_.asScala()).to[Seq]
+    val ports = portsResources.flatMap(_.ranges.flatMap(_.asScala()).to[Seq])
+
+    val labels = app.labels.map {
+      case (key, value) =>
+        Label.newBuilder.setKey(key).setValue(value).build()
+    }
 
     val taskId = newTaskId(app.id)
     val builder = TaskInfo.newBuilder
@@ -71,45 +110,72 @@ class TaskBuilder(app: AppDefinition,
       .addResources(ScalarResource(Resource.CPUS, app.cpus, cpuRole))
       .addResources(ScalarResource(Resource.MEM, app.mem, memRole))
 
-    if (portsResource.ranges.nonEmpty) {
-      builder.addResources(portsResource)
+    if (app.disk != 0) {
+      // This is only supported since Mesos 0.22.0 and will result in TASK_LOST messages in combination
+      // with older mesos versions. So if the user leaves this untouched, we will NOT pass it to
+      // Mesos. If the user chooses a value != 0, we assume that they rely on this value and we DO pass it to Mesos
+      // irrespective of the version.
+      //
+      // This is not enforced in Mesos without specifically configuring the appropriate enforcer.
+      builder.addResources(ScalarResource(Resource.DISK, app.disk, diskRole))
     }
+
+    if (labels.nonEmpty)
+      builder.setLabels(Labels.newBuilder.addAllLabels(labels.asJava))
+
+    portsResources.foreach(builder.addResources(_))
 
     val containerProto: Option[ContainerInfo] =
       app.container.map { c =>
         val portMappings = c.docker.map { d =>
           d.portMappings.map { pms =>
             pms zip ports map {
-              case (mapping, port) => mapping.copy(hostPort = port.toInt)
+              case (mapping, port) =>
+                // Use case: containerPort = 0 and hostPort = 0
+                //
+                // For apps that have their own service registry and require p2p communication,
+                // they will need to advertise
+                // the externally visible ports that their components come up on.
+                // Since they generally know there container port and advertise that, this is
+                // fixed most easily if the container port is the same as the externally visible host
+                // port.
+                if (mapping.containerPort == 0) {
+                  mapping.copy(hostPort = port.toInt, containerPort = port.toInt)
+                }
+                else {
+                  mapping.copy(hostPort = port.toInt)
+                }
             }
           }
         }
         val containerWithPortMappings = portMappings match {
           case None => c
           case Some(newMappings) => c.copy(
-            docker = c.docker.map { _.copy(portMappings = newMappings) }
+            docker = c.docker.map {
+              _.copy(portMappings = newMappings)
+            }
           )
         }
-        containerWithPortMappings.toMesos
+        containerWithPortMappings.toMesos()
       }
 
+    val envPrefix: Option[String] = config.envVarsPrefix.get
     executor match {
       case CommandExecutor() =>
-        builder.setCommand(TaskBuilder.commandInfo(app, Some(taskId), host, ports))
-        for (c <- containerProto) builder.setContainer(c)
+        builder.setCommand(TaskBuilder.commandInfo(app, Some(taskId), host, ports, envPrefix))
+        containerProto.foreach(builder.setContainer)
 
       case PathExecutor(path) =>
         val executorId = f"marathon-${taskId.getValue}" // Fresh executor
         val executorPath = s"'$path'" // TODO: Really escape this.
         val cmd = app.cmd orElse app.args.map(_ mkString " ") getOrElse ""
         val shell = s"chmod ug+rx $executorPath && exec $executorPath $cmd"
-        val command =
-          TaskBuilder.commandInfo(app, Some(taskId), host, ports).toBuilder.setValue(shell)
+        val command = TaskBuilder.commandInfo(app, Some(taskId), host, ports, envPrefix).toBuilder.setValue(shell)
 
         val info = ExecutorInfo.newBuilder()
           .setExecutorId(ExecutorID.newBuilder().setValue(executorId))
           .setCommand(command)
-        for (c <- containerProto) info.setContainer(c)
+        containerProto.foreach(info.setContainer)
         builder.setExecutor(info)
         val binary = new ByteArrayOutputStream()
         mapper.writeValue(binary, app)
@@ -119,17 +185,8 @@ class TaskBuilder(app: AppDefinition,
     // Mesos supports at most one health check, and only COMMAND checks
     // are currently implemented in the Mesos health check helper program.
     val mesosHealthChecks: Set[org.apache.mesos.Protos.HealthCheck] =
-      app.healthChecks.flatMap { healthCheck =>
-        if (healthCheck.protocol != Protocol.COMMAND) None
-        else {
-          try { Some(healthCheck.toMesos(ports.map(_.toInt))) }
-          catch {
-            case cause: Throwable =>
-              log.warn(s"An error occurred with health check [$healthCheck]\n" +
-                s"Error: [${cause.getMessage}]")
-              None
-          }
-        }
+      app.healthChecks.collect {
+        case healthCheck: HealthCheck if healthCheck.protocol == Protocol.COMMAND => healthCheck.toMesos
       }
 
     if (mesosHealthChecks.size > 1) {
@@ -146,69 +203,20 @@ class TaskBuilder(app: AppDefinition,
     Some(builder.build -> ports)
   }
 
-  private def offerMatches(offer: Offer): Option[(String, String, String, RangesResource)] = {
-    var cpuRole = ""
-    var memRole = ""
-    var diskRole = ""
-    val portMatcher = new PortsMatcher(app, offer)
-
-    for (resource <- offer.getResourcesList.asScala) {
-      if (cpuRole.isEmpty &&
-        resource.getName == Resource.CPUS &&
-        resource.getScalar.getValue >= app.cpus) {
-        cpuRole = resource.getRole
-      }
-      if (memRole.isEmpty &&
-        resource.getName == Resource.MEM &&
-        resource.getScalar.getValue >= app.mem) {
-        memRole = resource.getRole
-      }
-      if (diskRole.isEmpty &&
-        resource.getName == Resource.DISK &&
-        resource.getScalar.getValue >= app.disk) {
-        diskRole = resource.getRole
-      }
-    }
-
-    if (cpuRole.isEmpty || memRole.isEmpty || diskRole.isEmpty) {
-      return None
-    }
-
-    val badConstraints: Set[Constraint] = {
-      val runningTasks = taskTracker.get(app.id)
-      app.constraints.filterNot { constraint =>
-        Constraints.meetsConstraint(runningTasks, offer, constraint)
-      }
-    }
-
-    portMatcher.portRanges match {
-      case None =>
-        log.warn("App ports are not available in the offer.")
-        None
-
-      case _ if badConstraints.nonEmpty =>
-        log.warn(
-          s"Offer did not satisfy constraints for app [${app.id}].\n" +
-            s"Conflicting constraints are: [${badConstraints.mkString(", ")}]"
-        )
-        None
-
-      case Some(portRanges) =>
-        log.debug("Met all constraints.")
-        Some((cpuRole, memRole, diskRole, portRanges))
-    }
-  }
-
 }
 
 object TaskBuilder {
 
-  def commandInfo(app: AppDefinition, taskId: Option[TaskID], host: Option[String], ports: Seq[Long]): CommandInfo = {
+  def commandInfo(app: AppDefinition,
+                  taskId: Option[TaskID],
+                  host: Option[String],
+                  ports: Seq[Long],
+                  envPrefix: Option[String]): CommandInfo = {
     val containerPorts = for (pms <- app.portMappings) yield pms.map(_.containerPort)
     val declaredPorts = containerPorts.getOrElse(app.ports)
     val envMap: Map[String, String] =
       taskContextEnv(app, taskId) ++
-        portsEnv(declaredPorts, ports) ++ host.map("HOST" -> _) ++
+        addPrefix(envPrefix, portsEnv(declaredPorts, ports) ++ host.map("HOST" -> _).toMap) ++
         app.env
 
     val builder = CommandInfo.newBuilder()
@@ -225,8 +233,11 @@ object TaskBuilder {
     app.args.foreach { argv =>
       builder.setShell(false)
       builder.addAllArguments(argv.asJava)
+      //mesos command executor expects cmd and arguments
+      if (app.container.isEmpty) builder.setValue(argv.head)
     }
 
+    //scalastyle:off null
     if (app.uris != null) {
       val uriProtos = app.uris.map(uri => {
         CommandInfo.URI.newBuilder()
@@ -236,6 +247,7 @@ object TaskBuilder {
       })
       builder.addAllUris(uriProtos.asJava)
     }
+    //scalastyle:on
 
     app.user.foreach(builder.setUser)
 
@@ -265,34 +277,43 @@ object TaskBuilder {
 
   def portsEnv(definedPorts: Seq[Integer], assignedPorts: Seq[Long]): Map[String, String] = {
     if (assignedPorts.isEmpty) {
-      return Map.empty
+      Map.empty
     }
+    else {
+      val env = Map.newBuilder[String, String]
 
-    val env = mutable.HashMap.empty[String, String]
+      assignedPorts.zipWithIndex.foreach {
+        case (p, n) =>
+          env += (s"PORT$n" -> p.toString)
+      }
 
-    assignedPorts.zipWithIndex.foreach {
-      case (p, n) =>
-        env += (s"PORT$n" -> p.toString)
+      definedPorts.zip(assignedPorts).foreach {
+        case (defined, assigned) =>
+          if (defined != AppDefinition.RandomPortValue) {
+            env += (s"PORT_$defined" -> assigned.toString)
+          }
+      }
+
+      env += ("PORT" -> assignedPorts.head.toString)
+      env += ("PORTS" -> assignedPorts.mkString(","))
+      env.result()
     }
+  }
 
-    definedPorts.zip(assignedPorts).foreach {
-      case (defined, assigned) =>
-        if (defined != AppDefinition.RandomPortValue) {
-          env += (s"PORT_$defined" -> assigned.toString)
-        }
+  def addPrefix(envVarsPrefix: Option[String], env: Map[String, String]): Map[String, String] = {
+    envVarsPrefix match {
+      case Some(prefix) => env.map { case (key: String, value: String) => (prefix + key, value) }
+      case None         => env
     }
-
-    env += ("PORT" -> assignedPorts.head.toString)
-    env += ("PORTS" -> assignedPorts.mkString(","))
-    env.toMap
   }
 
   def taskContextEnv(app: AppDefinition, taskId: Option[TaskID]): Map[String, String] =
-    if (taskId.isEmpty) Map[String, String]()
-    else Map(
-      "MESOS_TASK_ID" -> taskId.get.getValue,
-      "MARATHON_APP_ID" -> app.id.toString,
-      "MARATHON_APP_VERSION" -> app.version.toString
-    )
-
+    if (taskId.isEmpty)
+      Map.empty
+    else
+      Map(
+        "MESOS_TASK_ID" -> taskId.get.getValue,
+        "MARATHON_APP_ID" -> app.id.toString,
+        "MARATHON_APP_VERSION" -> app.version.toString
+      )
 }

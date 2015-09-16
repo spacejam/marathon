@@ -1,5 +1,5 @@
 [![Stories in Ready](https://badge.waffle.io/mesosphere/marathon.png?label=ready&title=Ready)](https://waffle.io/mesosphere/marathon)
-# [Marathon](https://mesosphere.github.io/marathon/) [![Build Status](https://travis-ci.org/mesosphere/marathon.png?branch=master)](https://travis-ci.org/mesosphere/marathon)
+# [Marathon](https://mesosphere.github.io/marathon/) [![Build Status](https://travis-ci.org/mesosphere/marathon.png?branch=master)](https://travis-ci.org/mesosphere/marathon) [![Coverage Status](https://coveralls.io/repos/mesosphere/marathon/badge.svg?branch=master)](https://coveralls.io/r/mesosphere/marathon?branch=master)
 
 Marathon is an [Apache Mesos][Mesos] framework for long-running applications. Given that
 you have Mesos running as the kernel for your datacenter, Marathon is the
@@ -11,17 +11,12 @@ starting, stopping, and scaling applications. Marathon is written in Scala and
 can run in highly-available mode by running multiple copies. The
 state of running tasks gets stored in the Mesos state abstraction.
 
-Try Marathon now with [Mesosphere for Google Compute Platform](http://google.mesosphere.com) or [Mesosphere for DigitalOcean](http://digitalocean.mesosphere.com).
-
 Marathon is a *meta framework*: you can start other Mesos frameworks such as
 Chronos or [Storm][Storm] with it to ensure they survive machine failures.
 It can launch anything that can be launched in a standard shell. In fact, you
 can even start other Marathon instances via Marathon.
 
 Using Marathon versions 0.7.0+ and Mesos 0.20.0+, you can [deploy, run and scale Docker containers](https://mesosphere.github.io/marathon/docs/native-docker.html) with ease.
-
-Documentation for installing and configuring the full Mesosphere stack including Mesos and Marathon is
-available on the [Mesosphere website](http://mesosphere.com/docs/).
 
 ## Features
 
@@ -37,6 +32,16 @@ available on the [Mesosphere website](http://mesosphere.com/docs/).
 * *Basic Auth* and *SSL*
 * *Metrics*: available at `/metrics` in JSON format
 
+## Documentation
+
+Marathon documentation is available on the [Marathon GitHub pages site](http://mesosphere.github.io/marathon/).
+
+Documentation for installing and configuring the full Mesosphere stack including Mesos and Marathon is available on the [Mesosphere website](http://docs.mesosphere.com).
+
+### Contributing
+
+We heartily welcome external contributions to Marathon's documentation. Documentation should be committed to the `master` branch and published to our GitHub pages site using the instructions in [docs/README.md](https://github.com/mesosphere/marathon/tree/master/docs).
+
 ## Setting Up And Running Marathon
 
 ### Installation
@@ -51,9 +56,9 @@ Instructions on how to install prepackaged releases are available [in the Marath
 
 ##### Building from Source
 
-1.  To build Marathon from source, check out this repo and use sbt to build a JAR:
+1.  To build Marathon from source, check out this repo and submodules and use sbt to build a JAR:
 
-        git clone https://github.com/mesosphere/marathon.git
+        git clone --recursive https://github.com/mesosphere/marathon.git
         cd marathon
         sbt assembly
 
@@ -76,35 +81,29 @@ options, see [the Marathon docs](https://mesosphere.github.io/marathon/docs/).
 
 ## Developing Marathon
 
-The [Marathon Wiki Page](https://github.com/mesosphere/marathon/wiki/Developing-Marathon-in-a-Preconfigured-VM)
-contains documentation on simplifying local development and testing of Marathon
-including how to run a Mesos environment inside a preconfigured virtual machine running on Vagrant and a list of recipes for launching applications that test specific Marathon
-features.
+See [the documentation](https://mesosphere.github.io/marathon/docs/developing-vm.html) on how to run Marathon locally inside a virtual machine.
 
 ### Running the development Docker
 
 Build tip:
 
-    docker build -t marathon-tip .
+    docker build -t marathon-head .
 
 Run it:
 
-    docker run marathon-tip --master local --zk zk://localhost:2181/marathon
+    docker run marathon-head --master local --zk zk://localhost:2181/marathon
 
 If you want to inspect the contents of the Docker:
 
-    docker run -i -t --entrypoint=/bin/bash marathon-tip -s
+    docker run -i -t --entrypoint=/bin/bash marathon-head -s
 
-## Documentation
+### Marathon UI
 
-Marathon documentation is available on the [Marathon GitHub pages site](http://mesosphere.github.io/marathon/).
-
-### Contributing
-
-We heartily welcome external contributions to Marathon's documentation. Documentation should be committed to the `master` branch and published to our GitHub pages site using the instructions in [docs/README.md](https://github.com/mesosphere/marathon/tree/master/docs).
+To develop on the web UI look into the instructions of the [Marathon UI](https://github.com/mesosphere/marathon-ui) repository.
 
 ## Marathon Clients
 
+* [marathonctl](https://github.com/shoenig/marathonctl) A handy CLI tool for controlling Marathon
 * [Ruby gem and command line client](https://rubygems.org/gems/marathon-api)
 
     Running Chronos with the Ruby Marathon Client:
@@ -114,6 +113,7 @@ We heartily welcome external contributions to Marathon's documentation. Document
             ./chronos/target/chronos-1.0-SNAPSHOT.jar" -c 1.0 -m 1024
 * [Scala client](https://github.com/guidewire/marathon-client), developed at Guidewire
 * [Java client](https://github.com/mohitsoni/marathon-client) by Mohit Soni
+* [Maven plugin](https://github.com/holidaycheck/marathon-maven-plugin), developed at [HolidayCheck](http://www.holidaycheck.com/)
 * [Python client](https://github.com/thefactory/marathon-python), developed at [The Factory](http://www.thefactory.com)
 * [Python client](https://github.com/Wizcorp/marathon-client.py), developed at [Wizcorp](http://www.wizcorp.jp)
 * [Go client](https://github.com/gambol99/go-marathon) by Rohith Jayawardene
@@ -123,10 +123,12 @@ We heartily welcome external contributions to Marathon's documentation. Document
 
 ## Companies using Marathon
 
-Marathon is managing applications on more than 100,000 nodes at these companies, and many more:
+Across all installations Marathon is managing applications on more than 100,000 nodes world-wide. These are some of the companies using it:
 
 * [Airbnb](https://www.airbnb.com/)
+* [Allegro Group](http://www.allegrogroup.com)
 * [Artirix](http://www.artirix.com/)
+* [Corvisa](https://www.corvisa.com/)
 * [bol.com](https://www.bol.com/)
 * [Branding Brand](http://www.brandingbrand.com/)
 * [Daemon](http://www.daemon.com.au/)
@@ -136,12 +138,14 @@ Marathon is managing applications on more than 100,000 nodes at these companies,
 * [The Factory](https://github.com/thefactory/)
 * [Guidewire](http://www.guidewire.com/)
 * [Groupon](http://www.groupon.com/)
+* [HolidayCheck](http://www.holidaycheck.com/)
 * [Human API](https://humanapi.co/)
 * [ING](http://www.ing.com/)
 * [iQIYI](http://www.iqiyi.com/)
 * [Measurence](http://www.measurence.com/)
 * [Motus](http://www.motus.com/)
 * [OpenTable](http://www.opentable.com/)
+* [Orbitz](http://www.orbitz.com/)
 * [Otto](https://www.otto.de/)
 * [PayPal](https://www.paypal.com)
 * [Qubit](http://www.qubitproducts.com/)
@@ -149,6 +153,7 @@ Marathon is managing applications on more than 100,000 nodes at these companies,
 * [Sailthru](http://www.sailthru.com/)
 * [Strava](https://www.strava.com)
 * [Viadeo](http://www.viadeo.com)
+* [Wikia](http://www.wikia.com)
 * [WooRank](http://www.woorank.com)
 * [Yelp](http://www.yelp.com/)
 

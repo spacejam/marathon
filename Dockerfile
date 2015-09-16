@@ -1,4 +1,4 @@
-FROM mesosphere/mesos:0.22.0-1.0.ubuntu1404
+FROM mesosphere/mesos:0.22.1-1.0.ubuntu1404
 
 RUN apt-get update && \
     apt-get upgrade -y && \
@@ -13,7 +13,7 @@ RUN curl -SsL -O http://dl.bintray.com/sbt/debian/sbt-0.13.5.deb && \
 COPY . /marathon
 WORKDIR /marathon
 
-RUN sbt assembly && \
+RUN sbt -Dsbt.log.format=false assembly && \
     mv $(find target -name 'marathon-assembly-*.jar' | sort | tail -1) ./ && \
     rm -rf target/* ~/.sbt ~/.ivy2 && \
     mv marathon-assembly-*.jar target

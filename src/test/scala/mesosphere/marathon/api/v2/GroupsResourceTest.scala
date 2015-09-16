@@ -1,11 +1,13 @@
 package mesosphere.marathon.api.v2
 
+import mesosphere.marathon.api.v2.json.{ V2AppDefinition, V2GroupUpdate }
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.{ AppDefinition, GroupManager }
 import mesosphere.marathon.{ MarathonConf, MarathonSpec }
 import org.mockito.Mockito.when
 import org.scalatest.Matchers
 import play.api.libs.json.{ JsObject, Json }
+import mesosphere.marathon.api.v2.json.Formats._
 
 import scala.concurrent.Future
 import scala.concurrent.duration._
@@ -26,12 +28,13 @@ class GroupsResourceTest extends MarathonSpec with Matchers {
 
   test("dry run update") {
 
-    val app = AppDefinition(id = "/test/app".toRootPath, cmd = Some("test cmd"))
-    val update = GroupUpdate(id = Some("/test".toRootPath), apps = Some(Set(app)))
+    val app = V2AppDefinition(id = "/test/app".toRootPath, cmd = Some("test cmd"))
+    val update = V2GroupUpdate(id = Some("/test".toRootPath), apps = Some(Set(app)))
 
     when(groupManager.group(update.groupId)).thenReturn(Future.successful(None))
 
-    val result = groupsResource.update("/test", update, force = false, dryRun = true)
+    val body = Json.stringify(Json.toJson(update)).getBytes
+    val result = groupsResource.update("/test", force = false, dryRun = true, body)
     val json = Json.parse(result.getEntity.toString)
 
     val steps = (json \ "steps").as[Seq[JsObject]]

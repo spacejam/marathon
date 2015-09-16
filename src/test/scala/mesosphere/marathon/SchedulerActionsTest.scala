@@ -2,35 +2,33 @@ package mesosphere.marathon
 
 import akka.actor.ActorSystem
 import akka.testkit.{ TestKit, TestProbe }
-import com.fasterxml.jackson.databind.ObjectMapper
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.health.HealthCheckManager
-import mesosphere.marathon.state.{ PathId, AppDefinition, AppRepository }
-import mesosphere.marathon.tasks.{ TaskIdUtil, TaskQueue, TaskTracker }
-import org.apache.mesos.Protos.{ TaskState, TaskID, TaskStatus }
+import mesosphere.marathon.state._
+import mesosphere.marathon.tasks.{ OfferReviver, TaskQueue, TaskTracker }
+import org.apache.mesos.Protos.{ TaskID, TaskState, TaskStatus }
 import org.apache.mesos.SchedulerDriver
 import org.mockito.Mockito.{ times, verify, when }
 import org.scalatest.Matchers
 import org.scalatest.mock.MockitoSugar
 
-import scala.concurrent.{ Await, Future }
-import scala.concurrent.duration._
 import scala.collection.JavaConverters._
+import scala.concurrent.duration._
+import scala.concurrent.{ Await, Future }
 
 class SchedulerActionsTest extends TestKit(ActorSystem("TestSystem")) with MarathonSpec with Matchers with MockitoSugar {
   import system.dispatcher
 
   test("Reset rate limiter if application is stopped") {
-    val queue = new TaskQueue
+    val queue = new TaskQueue(conf = MarathonTestHelper.defaultConfig(), offerReviver = mock[OfferReviver])
     val repo = mock[AppRepository]
     val taskTracker = mock[TaskTracker]
 
     val scheduler = new SchedulerActions(
-      mock[ObjectMapper],
       repo,
+      mock[GroupRepository],
       mock[HealthCheckManager],
       taskTracker,
-      new TaskIdUtil,
       queue,
       system.eventStream,
       TestProbe().ref,
@@ -54,7 +52,7 @@ class SchedulerActionsTest extends TestKit(ActorSystem("TestSystem")) with Marat
   }
 
   test("Task reconciliation sends known running and staged tasks and empty list") {
-    val queue = new TaskQueue
+    val queue = new TaskQueue(conf = MarathonTestHelper.defaultConfig(), offerReviver = mock[OfferReviver])
     val repo = mock[AppRepository]
     val taskTracker = mock[TaskTracker]
     val driver = mock[SchedulerDriver]
@@ -79,11 +77,10 @@ class SchedulerActionsTest extends TestKit(ActorSystem("TestSystem")) with Marat
       .build()
 
     val scheduler = new SchedulerActions(
-      mock[ObjectMapper],
       repo,
+      mock[GroupRepository],
       mock[HealthCheckManager],
       taskTracker,
-      new TaskIdUtil,
       queue,
       system.eventStream,
       TestProbe().ref,
@@ -103,7 +100,7 @@ class SchedulerActionsTest extends TestKit(ActorSystem("TestSystem")) with Marat
   }
 
   test("Task reconciliation only one empty list, when no tasks are present in Marathon") {
-    val queue = new TaskQueue
+    val queue = new TaskQueue(conf = MarathonTestHelper.defaultConfig(), offerReviver = mock[OfferReviver])
     val repo = mock[AppRepository]
     val taskTracker = mock[TaskTracker]
     val driver = mock[SchedulerDriver]
@@ -119,11 +116,10 @@ class SchedulerActionsTest extends TestKit(ActorSystem("TestSystem")) with Marat
       .build()
 
     val scheduler = new SchedulerActions(
-      mock[ObjectMapper],
       repo,
+      mock[GroupRepository],
       mock[HealthCheckManager],
       taskTracker,
-      new TaskIdUtil,
       queue,
       system.eventStream,
       TestProbe().ref,

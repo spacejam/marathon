@@ -1,119 +1,81 @@
 package mesosphere.marathon.state
 
-import com.codahale.metrics.{ Histogram, MetricRegistry }
-import com.codahale.metrics.MetricRegistry.name
-import com.google.protobuf.InvalidProtocolBufferException
-import org.apache.mesos.state.State
-import scala.collection.JavaConverters._
-import scala.concurrent.{ ExecutionException, Future }
-import mesosphere.marathon.StorageException
-import mesosphere.util.LockManager
-import mesosphere.util.{ ThreadPoolContext, BackToTheFuture }
-import mesosphere.marathon.MarathonConf
-import mesosphere.util.BackToTheFuture
-import scala.concurrent.duration._
+import mesosphere.marathon.StoreCommandFailedException
+import mesosphere.marathon.metrics.{ MetricPrefixes, Metrics }
+import mesosphere.util.{ LockManager, ThreadPoolContext }
+import mesosphere.util.state.PersistentStore
+import mesosphere.marathon.metrics.Metrics.Histogram
 import org.slf4j.LoggerFactory
 
+import scala.concurrent.Future
+import scala.reflect.ClassTag
+import scala.util.control.NonFatal
+
 class MarathonStore[S <: MarathonState[_, S]](
-  conf: MarathonConf,
-  state: State,
-  registry: MetricRegistry,
-  newState: () => S,
-  prefix: String = "app:")(
-    implicit val timeout: BackToTheFuture.Timeout = BackToTheFuture.Timeout(Duration(conf.marathonStoreTimeout(),
-      MILLISECONDS)))
-    extends PersistenceStore[S] {
+    store: PersistentStore,
+    metrics: Metrics,
+    newState: () => S,
+    prefix: String = "app:")(implicit ct: ClassTag[S]) extends EntityStore[S] {
 
   import ThreadPoolContext.context
-  import BackToTheFuture.futureToFutureOption
-
   private[this] val log = LoggerFactory.getLogger(getClass)
-  private[this] lazy val locks = LockManager[String]()
 
-  def contentClassName: String = newState().getClass.getSimpleName
-
-  protected[this] val bytesRead: Histogram = registry.histogram(name(getClass, contentClassName, "read-data-size"))
-  protected[this] val bytesWritten: Histogram = registry.histogram(name(getClass, contentClassName, "write-data-size"))
+  private[this] lazy val lockManager = LockManager.create()
+  protected[this] def metricsPrefix = MetricPrefixes.SERVICE
+  protected[this] val bytesRead: Histogram =
+    metrics.histogram(metrics.name(metricsPrefix, getClass, s"${ct.runtimeClass.getSimpleName}.read-data-size"))
+  protected[this] val bytesWritten: Histogram =
+    metrics.histogram(metrics.name(metricsPrefix, getClass, s"${ct.runtimeClass.getSimpleName}.write-data-size"))
 
   def fetch(key: String): Future[Option[S]] = {
-    state.fetch(prefix + key) map {
-      case Some(variable) =>
-        bytesRead.update(variable.value.length)
-        stateFromBytes(variable.value)
+    store.load(prefix + key)
+      .map {
+        _.map { entity =>
+          bytesRead.update(entity.bytes.length)
+          stateFromBytes(entity.bytes.toArray)
+        }
+      }
+      .recover(exceptionTransform(s"Could not fetch ${ct.runtimeClass.getSimpleName} with key: $key"))
+  }
+
+  def modify(key: String)(f: Update): Future[S] = lockManager.executeSequentially(key) {
+    val res = store.load(prefix + key).flatMap {
+      case Some(entity) =>
+        bytesRead.update(entity.bytes.length)
+        val updated = f(() => stateFromBytes(entity.bytes.toArray))
+        val updatedEntity = entity.withNewContent(updated.toProtoByteArray)
+        bytesWritten.update(updatedEntity.bytes.length)
+        store.update(updatedEntity)
       case None =>
-        throw new StorageException(s"Failed to read $key")
+        val created = f(() => newState()).toProtoByteArray
+        bytesWritten.update(created.length)
+        store.create(prefix + key, created)
     }
-  }
-
-  def modify(key: String)(f: (() => S) => S): Future[Option[S]] = {
-    val lock = locks.get(key)
-    lock.acquire()
-
-    val res = state.fetch(prefix + key) flatMap {
-      case Some(variable) =>
-        bytesRead.update(variable.value.length)
-        val deserialize = () => stateFromBytes(variable.value).getOrElse(newState())
-        state.store(variable.mutate(f(deserialize).toProtoByteArray)) map {
-          case Some(newVar) =>
-            bytesWritten.update(newVar.value.size)
-            stateFromBytes(newVar.value)
-          case None =>
-            throw new StorageException(s"Failed to store $key")
-        }
-      case None => throw new StorageException(s"Failed to read $key")
-    }
-
-    res onComplete { _ =>
-      lock.release()
-    }
-
     res
+      .map { entity => stateFromBytes(entity.bytes.toArray) }
+      .recover(exceptionTransform(s"Could not modify ${ct.runtimeClass.getSimpleName} with key: $key"))
   }
 
-  def expunge(key: String): Future[Boolean] = {
-    val lock = locks.get(key)
-    lock.acquire()
-
-    val res = state.fetch(prefix + key) flatMap {
-      case Some(variable) =>
-        bytesRead.update(Option(variable.value).map(_.length).getOrElse(0))
-        state.expunge(variable) map {
-          case Some(b) => b.booleanValue()
-          case None    => throw new StorageException(s"Failed to expunge $key")
-        }
-
-      case None => throw new StorageException(s"Failed to read $key")
-    }
-
-    res onComplete { _ =>
-      lock.release()
-    }
-
-    res
+  def expunge(key: String): Future[Boolean] = lockManager.executeSequentially(key) {
+    store.delete(prefix + key)
+      .recover(exceptionTransform(s"Could not expunge ${ct.runtimeClass.getSimpleName} with key: $key"))
   }
 
-  def names(): Future[Iterator[String]] = {
-    // TODO use implicit conversion after it has been merged
-    Future {
-      try {
-        state.names().get.asScala.collect {
-          case name if name startsWith prefix =>
-            name.replaceFirst(prefix, "")
+  def names(): Future[Seq[String]] = {
+    store.allIds()
+      .map {
+        _.collect {
+          case name: String if name startsWith prefix => name.replaceFirst(prefix, "")
         }
       }
-      catch {
-        // Thrown when node doesn't exist
-        case e: ExecutionException => Seq().iterator
-      }
-    }
+      .recover(exceptionTransform(s"Could not list names for ${ct.runtimeClass.getSimpleName}"))
   }
 
-  private def stateFromBytes(bytes: Array[Byte]): Option[S] = {
-    try {
-      Some(newState().mergeFromProto(bytes))
-    }
-    catch {
-      case e: InvalidProtocolBufferException => None
-    }
+  private[this] def exceptionTransform[T](errorMessage: String): PartialFunction[Throwable, T] = {
+    case NonFatal(ex) => throw new StoreCommandFailedException(errorMessage, ex)
+  }
+
+  private def stateFromBytes(bytes: Array[Byte]): S = {
+    newState().mergeFromProto(bytes)
   }
 }

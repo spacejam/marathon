@@ -9,10 +9,11 @@ import com.google.common.collect.Lists
 import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.event.{ MesosStatusUpdateEvent, SchedulerRegisteredEvent, SchedulerReregisteredEvent }
 import mesosphere.marathon.health.HealthCheckManager
+import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.{ AppDefinition, AppRepository, Timestamp }
-import mesosphere.marathon.tasks.{ TaskIdUtil, TaskQueue, TaskTracker }
-import mesosphere.mesos.util.FrameworkIdUtil
+import mesosphere.marathon.tasks._
+import mesosphere.util.state.FrameworkIdUtil
 import org.apache.mesos.Protos._
 import org.apache.mesos.SchedulerDriver
 import org.mockito.ArgumentCaptor
@@ -37,21 +38,23 @@ class MarathonSchedulerTest extends TestKit(ActorSystem("System")) with Marathon
   var config: MarathonConf = _
   var eventBus: EventStream = _
 
-  val metricRegistry = new MetricRegistry
-
   before {
     repo = mock[AppRepository]
     hcManager = mock[HealthCheckManager]
     tracker = mock[TaskTracker]
-    queue = spy(new TaskQueue)
+    queue = spy(new TaskQueue(offerReviver = mock[OfferReviver], conf = MarathonTestHelper.defaultConfig()))
     frameworkIdUtil = mock[FrameworkIdUtil]
-    config = defaultConfig()
+    config = defaultConfig(maxTasksPerOffer = 10)
     taskIdUtil = TaskIdUtil
     probe = TestProbe()
     eventBus = system.eventStream
     scheduler = new MarathonScheduler(
       eventBus,
-      new ObjectMapper,
+      new IterativeOfferMatcher(
+        config,
+        queue, tracker, new DefaultTaskFactory(taskIdUtil, tracker, config, new ObjectMapper()),
+        new IterativeOfferMatcherMetrics(new Metrics(new MetricRegistry))
+      ),
       probe.ref,
       repo,
       hcManager,
@@ -60,7 +63,11 @@ class MarathonSchedulerTest extends TestKit(ActorSystem("System")) with Marathon
       frameworkIdUtil,
       taskIdUtil,
       mock[ActorSystem],
-      config
+      config,
+      offerReviver = mock[OfferReviver],
+      new SchedulerCallbacks {
+        override def disconnected(): Unit = {}
+      }
     )
   }
 
@@ -88,24 +95,65 @@ class MarathonSchedulerTest extends TestKit(ActorSystem("System")) with Marathon
 
     scheduler.resourceOffers(driver, offers)
 
-    val offersCaptor = ArgumentCaptor.forClass(classOf[java.util.List[OfferID]])
-    val taskInfosCaptor = ArgumentCaptor.forClass(classOf[java.util.List[TaskInfo]])
+    val offersCaptor = ArgumentCaptor.forClass(classOf[java.util.Collection[OfferID]])
+    val taskInfosCaptor = ArgumentCaptor.forClass(classOf[java.util.Collection[TaskInfo]])
     val marathonTaskCaptor = ArgumentCaptor.forClass(classOf[MarathonTask])
 
     verify(driver).launchTasks(offersCaptor.capture(), taskInfosCaptor.capture())
     verify(tracker).created(same(app.id), marathonTaskCaptor.capture())
 
     assert(1 == offersCaptor.getValue.size())
-    assert(offer.getId == offersCaptor.getValue.get(0))
+    assert(offer.getId == offersCaptor.getValue.asScala.head)
 
     assert(1 == taskInfosCaptor.getValue.size())
-    val taskInfoPortVar = taskInfosCaptor.getValue.get(0).getCommand.getEnvironment
+    val taskInfoPortVar = taskInfosCaptor.getValue.asScala.head.getCommand.getEnvironment
       .getVariablesList.asScala.find(v => v.getName == "PORT")
     assert(taskInfoPortVar.isDefined)
     val marathonTaskPort = marathonTaskCaptor.getValue.getPorts(0)
     assert(taskInfoPortVar.get.getValue == marathonTaskPort.toString)
     val marathonTaskVersion = marathonTaskCaptor.getValue.getVersion
     assert(now.toString() == marathonTaskVersion)
+  }
+
+  test("Multiple tasks per ResourceOffer") {
+    val driver = mock[SchedulerDriver]
+    val offer = makeBasicOffer(cpus = 4, mem = 1024, disk = 4000, beginPort = 31000, endPort = 32000).build
+    val offers = Lists.newArrayList(offer)
+    val now = Timestamp.now()
+    val app = AppDefinition(
+      id = "testOffers".toRootPath,
+      executor = "//cmd",
+      ports = Seq(8080),
+      instances = 3,
+      version = now
+    )
+
+    queue.add(app, 3)
+
+    when(tracker.checkStagedTasks).thenReturn(Seq())
+    when(repo.currentAppVersions())
+      .thenReturn(Future.successful(Map(app.id -> app.version)))
+
+    scheduler.resourceOffers(driver, offers)
+
+    val offersCaptor = ArgumentCaptor.forClass(classOf[java.util.Collection[OfferID]])
+    val taskInfosCaptor = ArgumentCaptor.forClass(classOf[java.util.Collection[TaskInfo]])
+    val marathonTaskCaptor = ArgumentCaptor.forClass(classOf[MarathonTask])
+
+    verify(driver).launchTasks(offersCaptor.capture(), taskInfosCaptor.capture())
+    verify(tracker, times(3)).created(same(app.id), marathonTaskCaptor.capture())
+
+    assert(1 == offersCaptor.getValue.size())
+    assert(offer.getId == offersCaptor.getValue.asScala.head)
+
+    assert(3 == taskInfosCaptor.getValue.size())
+    val taskInfoPortVars = taskInfosCaptor.getValue.asScala.map { taskInfo =>
+      taskInfo.getCommand.getEnvironment
+        .getVariablesList.asScala.find(v => v.getName == "PORT")
+    }
+
+    // three different ports
+    assert(taskInfoPortVars.toSet.size == 3)
   }
 
   test("Publishes event when registered") {
@@ -193,7 +241,7 @@ class MarathonSchedulerTest extends TestKit(ActorSystem("System")) with Marathon
   test("Publishes event when disconnected") {
     val driver = mock[SchedulerDriver]
 
-    eventBus.subscribe(probe.ref, classOf[SchedulerDisconnectedEvent])
+    eventStream.subscribe(probe.ref, classOf[SchedulerDisconnectedEvent])
 
     scheduler.disconnected(driver)
 
@@ -203,7 +251,7 @@ class MarathonSchedulerTest extends TestKit(ActorSystem("System")) with Marathon
       assert(msg.eventType == "scheduler_reregistered_event")
     }
     finally {
-      eventBus.unsubscribe(probe.ref)
+      eventStream.unsubscribe(probe.ref)
     }
   }
   */

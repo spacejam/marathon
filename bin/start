@@ -34,7 +34,8 @@ require_arg() {
   fi
 }
 
-for env_op in `env | grep ^MARATHON_ | sed -e '/^MARATHON_APP/d' -e 's/MARATHON_//' -e 's/=/ /' | awk '{printf("%s%s ", "--", tolower($1)); for(i=2;i<=NF;i++){printf("%s ", $i)}}'| sed -e 's/ $//'`; do
+# Filter out MARATHON_APP* env variables. All MARATHON_XXX=yyy variables are interpreted as -xxx yyy application parameter
+for env_op in `env | grep -v ^MARATHON_APP | grep ^MARATHON_ | awk '{gsub(/MARATHON_/,""); gsub(/=/," "); printf("%s%s ", "--", tolower($1)); for(i=2;i<=NF;i++){printf("%s ", $i)}}'`; do
   addApplication "$env_op"
 done
 
@@ -61,6 +62,10 @@ then
     addJava "$arg"
   done
 fi
+
+addJava -Dcom.sun.management.jmxremote.port=6666
+addJava -Dcom.sun.management.jmxremote.ssl=false 
+addJava -Dcom.sun.management.jmxremote.authenticate=false
 
 # Start Marathon
 marathon_jar=$(find "$FRAMEWORK_HOME"/target -name 'marathon-assembly-*.jar' | sort | tail -1)

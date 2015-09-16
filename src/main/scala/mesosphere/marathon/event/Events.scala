@@ -10,6 +10,8 @@ import org.apache.log4j.Logger
 import mesosphere.marathon.state.{ AppDefinition, PathId, Timestamp }
 import akka.actor.ActorSystem
 
+//scalastyle:off number.of.types
+
 trait EventSubscriber[C <: ScallopConf, M <: AbstractModule] {
   def configuration(): Class[C]
   def module(): Option[Class[M]]
@@ -38,6 +40,14 @@ class EventModule(conf: EventConfiguration) extends AbstractModule {
 
 object EventModule {
   final val busName = "events"
+}
+
+/** Local leadership events. They are not delivered via the event endpoints. */
+sealed trait LocalLeadershipEvent
+
+object LocalLeadershipEvent {
+  case object ElectedAsLeader extends LocalLeadershipEvent
+  case object Standby extends LocalLeadershipEvent
 }
 
 sealed trait MarathonEvent {
@@ -77,10 +87,7 @@ final case class SchedulerDisconnectedEvent(
 
 // event subscriptions
 
-sealed trait MarathonSubscriptionEvent extends MarathonEvent {
-  def clientIp: String
-  def callbackUrl: String
-}
+sealed trait MarathonSubscriptionEvent extends MarathonEvent
 
 case class Subscribe(
   clientIp: String,
@@ -95,6 +102,16 @@ case class Unsubscribe(
   eventType: String = "unsubscribe_event",
   timestamp: String = Timestamp.now().toString)
     extends MarathonSubscriptionEvent
+
+case class EventStreamAttached(
+  remoteAddress: String,
+  eventType: String = "event_stream_attached",
+  timestamp: String = Timestamp.now().toString) extends MarathonSubscriptionEvent
+
+case class EventStreamDetached(
+  remoteAddress: String,
+  eventType: String = "event_stream_detached",
+  timestamp: String = Timestamp.now().toString) extends MarathonSubscriptionEvent
 
 // health checks
 
@@ -152,11 +169,13 @@ case class GroupChangeFailed(
 
 case class DeploymentSuccess(
   id: String,
+  plan: DeploymentPlan,
   eventType: String = "deployment_success",
   timestamp: String = Timestamp.now().toString) extends UpgradeEvent
 
 case class DeploymentFailed(
   id: String,
+  plan: DeploymentPlan,
   eventType: String = "deployment_failed",
   timestamp: String = Timestamp.now().toString) extends UpgradeEvent
 

@@ -1,0 +1,23 @@
+...
+[info] Exception encountered when attempting to run a suite with class name: mesosphere.marathon.api.v2.json.V2AppDefinitionTest *** ABORTED ***
+[info]   java.lang.NoSuchMethodError: javax.el.ExpressionFactory.newInstance()Ljavax/el/ExpressionFactory;
+[info]   at org.hibernate.validator.internal.engine.messageinterpolation.InterpolationTerm.<clinit>(InterpolationTerm.java:59)
+[info]   at org.hibernate.validator.messageinterpolation.ResourceBundleMessageInterpolator.interpolateExpression(ResourceBundleMessageInterpolator.java:341)
+[info]   at org.hibernate.validator.messageinterpolation.ResourceBundleMessageInterpolator.interpolateMessage(ResourceBundleMessageInterpolator.java:279)
+[info]   at org.hibernate.validator.messageinterpolation.ResourceBundleMessageInterpolator.interpolate(ResourceBundleMessageInterpolator.java:182)
+[info]   at org.hibernate.validator.internal.engine.ValidationContext.interpolate(ValidationContext.java:362)
+[info]   at org.hibernate.validator.internal.engine.ValidationContext.createConstraintViolation(ValidationContext.java:271)
+[info]   at org.hibernate.validator.internal.engine.ValidationContext.createConstraintViolations(ValidationContext.java:232)
+[info]   at org.hibernate.validator.internal.engine.constraintvalidation.ConstraintTree.validateSingleConstraint(ConstraintTree.java:291)
+[info]   at org.hibernate.validator.internal.engine.constraintvalidation.ConstraintTree.validateConstraints(ConstraintTree.java:133)
+[info]   at org.hibernate.validator.internal.engine.constraintvalidation.ConstraintTree.validateConstraints(ConstraintTree.java:91)
+...
+[info] Run completed in 21 seconds, 126 milliseconds.
+[info] Total number of tests run: 476
+[info] Suites: completed 89, aborted 1
+[info] Tests: succeeded 476, failed 0, canceled 0, ignored 1, pending 0
+[info] *** 1 SUITE ABORTED ***
+[error] Error during tests:
+[error]         mesosphere.marathon.api.v2.json.V2AppDefinitionTest
+[error] (marathon/test:test) sbt.TestsFailedException: Tests unsuccessful
+[error] Total time: 25 s, completed Sep 15, 2015 7:47:52 PM

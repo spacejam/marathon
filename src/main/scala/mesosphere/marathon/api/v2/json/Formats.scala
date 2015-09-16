@@ -5,7 +5,6 @@ import java.lang.{ Double => JDouble }
 import mesosphere.marathon.Protos.Constraint.Operator
 import mesosphere.marathon.Protos.HealthCheckDefinition.Protocol
 import mesosphere.marathon.Protos.{ Constraint, MarathonTask }
-import mesosphere.marathon.api.v2.AppUpdate
 import mesosphere.marathon.event._
 import mesosphere.marathon.health.{ Health, HealthCheck }
 import mesosphere.marathon.state.Container.Docker.PortMapping
@@ -46,7 +45,7 @@ object Formats extends Formats {
 }
 
 trait Formats
-    extends AppDefinitionFormats
+    extends V2Formats
     with HealthCheckFormats
     with ContainerFormats
     with DeploymentFormats
@@ -129,6 +128,9 @@ trait Formats
     withoutRandom.distinct.size == withoutRandom.size
   }
 
+  def nonEmpty[C <: Iterable[_]](implicit reads: Reads[C]): Reads[C] =
+    Reads.filterNot[C](ValidationError(s"set must not be empty"))(_.isEmpty)(reads)
+
   def minValue[A](min: A)(implicit O: Ordering[A], reads: Reads[A]): Reads[A] =
     Reads.filterNot[A](ValidationError(s"value must not be less than $min"))(x => O.lt(x, min))(reads)
 
@@ -145,7 +147,7 @@ trait Formats
           case _: IllegalArgumentException => JsError(errorMsg(str))
         }
 
-      case x => JsError(s"expected string, got $x")
+      case x: JsValue => JsError(s"expected string, got $x")
     }
 
     val writes = Writes[A] { a: A => JsString(a.name) }
@@ -161,7 +163,7 @@ trait ContainerFormats {
     enumFormat(Network.valueOf, str => s"$str is not a valid network type")
 
   implicit lazy val PortMappingFormat: Format[Docker.PortMapping] = (
-    (__ \ "containerPort").format[Integer] ~
+    (__ \ "containerPort").formatNullable[Integer].withDefault(0) ~
     (__ \ "hostPort").formatNullable[Integer].withDefault(0) ~
     (__ \ "servicePort").formatNullable[Integer].withDefault(0) ~
     (__ \ "protocol").formatNullable[String].withDefault("tcp")
@@ -172,10 +174,11 @@ trait ContainerFormats {
     (__ \ "network").formatNullable[Network] ~
     (__ \ "portMappings").formatNullable[Seq[Docker.PortMapping]] ~
     (__ \ "privileged").formatNullable[Boolean].withDefault(false) ~
-    (__ \ "parameters").formatNullable[Seq[Parameter]].withDefault(Seq.empty)
-  )(Docker(_, _, _, _, _), unlift(Docker.unapply))
+    (__ \ "parameters").formatNullable[Seq[Parameter]].withDefault(Seq.empty) ~
+    (__ \ "forcePullImage").formatNullable[Boolean].withDefault(false)
+  )(Docker(_, _, _, _, _, _), unlift(Docker.unapply))
 
-  implicit val ModeFormat: Format[mesos.Volume.Mode] =
+  implicit lazy val ModeFormat: Format[mesos.Volume.Mode] =
     enumFormat(mesos.Volume.Mode.valueOf, str => s"$str is not a valid mode")
 
   implicit lazy val VolumeFormat: Format[Volume] = (
@@ -184,7 +187,7 @@ trait ContainerFormats {
     (__ \ "mode").format[mesos.Volume.Mode]
   )(Volume(_, _, _), unlift(Volume.unapply))
 
-  implicit val ContainerTypeFormat: Format[mesos.ContainerInfo.Type] =
+  implicit lazy val ContainerTypeFormat: Format[mesos.ContainerInfo.Type] =
     enumFormat(mesos.ContainerInfo.Type.valueOf, str => s"$str is not a valid container type")
 
   implicit lazy val ContainerFormat: Format[Container] = (
@@ -204,13 +207,15 @@ trait DeploymentFormats {
         JsArray(xs.to[Seq].map(b => JsNumber(b.toInt)))
       }
     )
-  implicit lazy val GroupFormat: Format[Group] = (
-    (__ \ "id").format[PathId] ~
-    (__ \ "apps").formatNullable[Set[AppDefinition]].withDefault(Group.DefaultApps) ~
-    (__ \ "groups").lazyFormatNullable(implicitly[Format[Set[Group]]]).withDefault(Group.DefaultGroups) ~
-    (__ \ "dependencies").formatNullable[Set[PathId]].withDefault(Group.DefaultDependencies) ~
-    (__ \ "version").formatNullable[Timestamp].withDefault(Group.DefaultVersion)
-  )(Group(_, _, _, _, _), unlift(Group.unapply))
+
+  implicit lazy val V2GroupUpdateFormat: Format[V2GroupUpdate] = (
+    (__ \ "id").formatNullable[PathId] ~
+    (__ \ "apps").formatNullable[Set[V2AppDefinition]] ~
+    (__ \ "groups").lazyFormatNullable(implicitly[Format[Set[V2GroupUpdate]]]) ~
+    (__ \ "dependencies").formatNullable[Set[PathId]] ~
+    (__ \ "scaleBy").formatNullable[Double] ~
+    (__ \ "version").formatNullable[Timestamp]
+  ) (V2GroupUpdate(_, _, _, _, _, _), unlift(V2GroupUpdate.unapply))
 
   implicit lazy val URLToStringMapFormat: Format[Map[java.net.URL, String]] = Format(
     Reads.of[Map[String, String]]
@@ -222,6 +227,7 @@ trait DeploymentFormats {
       Json.toJson(m)
     }
   )
+
   implicit lazy val DeploymentActionWrites: Writes[DeploymentAction] = Writes { action =>
     Json.obj(
       "type" -> action.getClass.getSimpleName,
@@ -230,22 +236,31 @@ trait DeploymentFormats {
   }
 
   implicit lazy val DeploymentStepWrites: Writes[DeploymentStep] = Json.writes[DeploymentStep]
-  implicit lazy val DeploymentPlanWrites: Writes[DeploymentPlan] = (
-    (__ \ "id").write[String] ~
-    (__ \ "original").write[Group] ~
-    (__ \ "target").write[Group] ~
-    (__ \ "steps").write[Seq[DeploymentStep]] ~
-    (__ \ "version").write[Timestamp]
-  )(unlift(DeploymentPlan.unapply))
 }
 
 trait EventFormats {
   import Formats._
 
   implicit lazy val AppTerminatedEventWrites: Writes[AppTerminatedEvent] = Json.writes[AppTerminatedEvent]
-  implicit lazy val ApiPostEventWrites: Writes[ApiPostEvent] = Json.writes[ApiPostEvent]
+
+  implicit lazy val ApiPostEventWrites: Writes[ApiPostEvent] = Writes { event =>
+    Json.obj(
+      "clientIp" -> event.clientIp,
+      "uri" -> event.uri,
+      "appDefinition" -> V2AppDefinition(event.appDefinition),
+      "eventType" -> event.eventType,
+      "timestamp" -> event.timestamp
+    )
+  }
+
+  implicit lazy val DeploymentPlanWrites: Writes[DeploymentPlan] = Writes { plan =>
+    V2DeploymentPlanWrites.writes(V2DeploymentPlan(plan))
+  }
+
   implicit lazy val SubscribeWrites: Writes[Subscribe] = Json.writes[Subscribe]
   implicit lazy val UnsubscribeWrites: Writes[Unsubscribe] = Json.writes[Unsubscribe]
+  implicit lazy val EventStreamAttachedWrites: Writes[EventStreamAttached] = Json.writes[EventStreamAttached]
+  implicit lazy val EventStreamDetachedWrites: Writes[EventStreamDetached] = Json.writes[EventStreamDetached]
   implicit lazy val AddHealthCheckWrites: Writes[AddHealthCheck] = Json.writes[AddHealthCheck]
   implicit lazy val RemoveHealthCheckWrites: Writes[RemoveHealthCheck] = Json.writes[RemoveHealthCheck]
   implicit lazy val FailedHealthCheckWrites: Writes[FailedHealthCheck] = Json.writes[FailedHealthCheck]
@@ -266,6 +281,33 @@ trait EventFormats {
     Json.writes[SchedulerRegisteredEvent]
   implicit lazy val SchedulerReregisteredEventWritesWrites: Writes[SchedulerReregisteredEvent] =
     Json.writes[SchedulerReregisteredEvent]
+
+  //scalastyle:off cyclomatic.complexity
+  def eventToJson(event: MarathonEvent): JsValue = event match {
+    case event: AppTerminatedEvent         => Json.toJson(event)
+    case event: ApiPostEvent               => Json.toJson(event)
+    case event: Subscribe                  => Json.toJson(event)
+    case event: Unsubscribe                => Json.toJson(event)
+    case event: EventStreamAttached        => Json.toJson(event)
+    case event: EventStreamDetached        => Json.toJson(event)
+    case event: AddHealthCheck             => Json.toJson(event)
+    case event: RemoveHealthCheck          => Json.toJson(event)
+    case event: FailedHealthCheck          => Json.toJson(event)
+    case event: HealthStatusChanged        => Json.toJson(event)
+    case event: GroupChangeSuccess         => Json.toJson(event)
+    case event: GroupChangeFailed          => Json.toJson(event)
+    case event: DeploymentSuccess          => Json.toJson(event)
+    case event: DeploymentFailed           => Json.toJson(event)
+    case event: DeploymentStatus           => Json.toJson(event)
+    case event: DeploymentStepSuccess      => Json.toJson(event)
+    case event: DeploymentStepFailure      => Json.toJson(event)
+    case event: MesosStatusUpdateEvent     => Json.toJson(event)
+    case event: MesosFrameworkMessageEvent => Json.toJson(event)
+    case event: SchedulerDisconnectedEvent => Json.toJson(event)
+    case event: SchedulerRegisteredEvent   => Json.toJson(event)
+    case event: SchedulerReregisteredEvent => Json.toJson(event)
+  }
+  //scalastyle:on
 }
 
 trait HealthCheckFormats {
@@ -306,8 +348,9 @@ trait HealthCheckFormats {
   }
 }
 
-trait AppDefinitionFormats {
+trait V2Formats {
   import Formats._
+  import mesosphere.marathon.api.v2.json.V2AppDefinition._
 
   implicit lazy val IdentifiableWrites = Json.writes[Identifiable]
 
@@ -338,103 +381,132 @@ trait AppDefinitionFormats {
     }
   )
 
-  implicit lazy val AppDefinitionReads: Reads[AppDefinition] = {
-    import mesosphere.marathon.state.AppDefinition._
-
+  implicit lazy val V2AppDefinitionReads: Reads[V2AppDefinition] = {
     val executorPattern = "^(//cmd)|(/?[^/]+(/[^/]+)*)|$".r
 
     (
       (__ \ "id").read[PathId].filterNot(_.isRoot) ~
-      (__ \ "cmd").readNullable[String] ~
+      (__ \ "cmd").readNullable[String](Reads.minLength(1)) ~
       (__ \ "args").readNullable[Seq[String]] ~
       (__ \ "user").readNullable[String] ~
-      (__ \ "env").readNullable[Map[String, String]].withDefault(DefaultEnv) ~
-      (__ \ "instances").readNullable[Integer](minValue(0)).withDefault(DefaultInstances) ~
-      (__ \ "cpus").readNullable[JDouble](greaterThan(0.0)).withDefault(DefaultCpus) ~
-      (__ \ "mem").readNullable[JDouble].withDefault(DefaultMem) ~
-      (__ \ "disk").readNullable[JDouble].withDefault(DefaultDisk) ~
-      (__ \ "executor").readNullable[String](Reads.pattern(executorPattern)).withDefault(DefaultExecutor) ~
-      (__ \ "constraints").readNullable[Set[Constraint]].withDefault(DefaultConstraints) ~
-      (__ \ "uris").readNullable[Seq[String]].withDefault(DefaultUris) ~
-      (__ \ "storeUrls").readNullable[Seq[String]].withDefault(DefaultStoreUrls) ~
-      (__ \ "ports").readNullable[Seq[Integer]](uniquePorts).withDefault(DefaultPorts) ~
-      (__ \ "requirePorts").readNullable[Boolean].withDefault(DefaultRequirePorts) ~
-      (__ \ "backoffSeconds").readNullable[Long].withDefault(DefaultBackoff.toSeconds).asSeconds ~
-      (__ \ "backoffFactor").readNullable[Double].withDefault(DefaultBackoffFactor) ~
-      (__ \ "maxLaunchDelaySeconds").readNullable[Long].withDefault(DefaultMaxLaunchDelay.toSeconds).asSeconds ~
+      (__ \ "env").readNullable[Map[String, String]].withDefault(AppDefinition.DefaultEnv) ~
+      (__ \ "instances").readNullable[Integer](minValue(0)).withDefault(AppDefinition.DefaultInstances) ~
+      (__ \ "cpus").readNullable[JDouble](greaterThan(0.0)).withDefault(AppDefinition.DefaultCpus) ~
+      (__ \ "mem").readNullable[JDouble].withDefault(AppDefinition.DefaultMem) ~
+      (__ \ "disk").readNullable[JDouble].withDefault(AppDefinition.DefaultDisk) ~
+      (__ \ "executor").readNullable[String](Reads.pattern(executorPattern))
+      .withDefault(AppDefinition.DefaultExecutor) ~
+      (__ \ "constraints").readNullable[Set[Constraint]].withDefault(AppDefinition.DefaultConstraints) ~
+      (__ \ "uris").readNullable[Seq[String]].withDefault(AppDefinition.DefaultUris) ~
+      (__ \ "storeUrls").readNullable[Seq[String]].withDefault(AppDefinition.DefaultStoreUrls) ~
+      (__ \ "ports").readNullable[Seq[Integer]](uniquePorts).withDefault(AppDefinition.DefaultPorts) ~
+      (__ \ "requirePorts").readNullable[Boolean].withDefault(AppDefinition.DefaultRequirePorts) ~
+      (__ \ "backoffSeconds").readNullable[Long].withDefault(AppDefinition.DefaultBackoff.toSeconds).asSeconds ~
+      (__ \ "backoffFactor").readNullable[Double].withDefault(AppDefinition.DefaultBackoffFactor) ~
+      (__ \ "maxLaunchDelaySeconds").readNullable[Long]
+      .withDefault(AppDefinition.DefaultMaxLaunchDelay.toSeconds).asSeconds ~
       (__ \ "container").readNullable[Container] ~
-      (__ \ "healthChecks").readNullable[Set[HealthCheck]].withDefault(DefaultHealthChecks) ~
-      (__ \ "dependencies").readNullable[Set[PathId]].withDefault(DefaultDependencies)
-    )(AppDefinition(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).flatMap { app =>
+      (__ \ "healthChecks").readNullable[Set[HealthCheck]].withDefault(AppDefinition.DefaultHealthChecks) ~
+      (__ \ "dependencies").readNullable[Set[PathId]].withDefault(AppDefinition.DefaultDependencies)
+    )(V2AppDefinition(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).flatMap { app =>
         // necessary because of case class limitations (good for another 21 fields)
         case class ExtraFields(
           upgradeStrategy: UpgradeStrategy,
           labels: Map[String, String],
+          acceptedResourceRoles: Option[Set[String]],
           version: Timestamp)
 
         val extraReads: Reads[ExtraFields] =
           (
-            (__ \ "upgradeStrategy").readNullable[UpgradeStrategy].withDefault(DefaultUpgradeStrategy) ~
-            (__ \ "labels").readNullable[Map[String, String]].withDefault(DefaultLabels) ~
+            (__ \ "upgradeStrategy").readNullable[UpgradeStrategy].withDefault(AppDefinition.DefaultUpgradeStrategy) ~
+            (__ \ "labels").readNullable[Map[String, String]].withDefault(AppDefinition.DefaultLabels) ~
+            (__ \ "acceptedResourceRoles").readNullable[Set[String]](nonEmpty) ~
             (__ \ "version").readNullable[Timestamp].withDefault(Timestamp.now())
-          )(ExtraFields(_, _, _))
+          )(ExtraFields)
 
         extraReads.map { extraFields =>
           app.copy(
             upgradeStrategy = extraFields.upgradeStrategy,
             labels = extraFields.labels,
+            acceptedResourceRoles = extraFields.acceptedResourceRoles,
             version = extraFields.version
           )
         }
       }
   }
 
-  implicit lazy val AppDefinitionWrites: Writes[AppDefinition] = {
-    implicit val durationWrites = Writes[FiniteDuration] { d =>
+  implicit lazy val V2AppDefinitionWrites: Writes[V2AppDefinition] = {
+    implicit lazy val durationWrites = Writes[FiniteDuration] { d =>
       JsNumber(d.toSeconds)
     }
 
-    Writes[AppDefinition] { app =>
-      try {
-        Json.obj(
-          "id" -> app.id.toString,
-          "cmd" -> app.cmd,
-          "args" -> app.args,
-          "user" -> app.user,
-          "env" -> app.env,
-          "instances" -> app.instances,
-          "cpus" -> app.cpus,
-          "mem" -> app.mem,
-          "disk" -> app.disk,
-          "executor" -> app.executor,
-          "constraints" -> app.constraints,
-          "uris" -> app.uris,
-          "storeUrls" -> app.storeUrls,
-          "ports" -> app.ports,
-          "requirePorts" -> app.requirePorts,
-          "backoffSeconds" -> app.backoff,
-          "backoffFactor" -> app.backoffFactor,
-          "maxLaunchDelaySeconds" -> app.maxLaunchDelay,
-          "container" -> app.container,
-          "healthChecks" -> app.healthChecks,
-          "dependencies" -> app.dependencies,
-          "upgradeStrategy" -> app.upgradeStrategy,
-          "labels" -> app.labels,
-          "version" -> app.version
-        )
-      }
-      catch {
-        case NonFatal(e) =>
-          throw e
-      }
+    Writes[V2AppDefinition] { app =>
+      Json.obj(
+        "id" -> app.id.toString,
+        "cmd" -> app.cmd,
+        "args" -> app.args,
+        "user" -> app.user,
+        "env" -> app.env,
+        "instances" -> app.instances,
+        "cpus" -> app.cpus,
+        "mem" -> app.mem,
+        "disk" -> app.disk,
+        "executor" -> app.executor,
+        "constraints" -> app.constraints,
+        "uris" -> app.uris,
+        "storeUrls" -> app.storeUrls,
+        // the ports field was written incorrectly in old code if a container was specified
+        // it should contain the service ports
+        "ports" -> app.toAppDefinition.servicePorts,
+        "requirePorts" -> app.requirePorts,
+        "backoffSeconds" -> app.backoff,
+        "backoffFactor" -> app.backoffFactor,
+        "maxLaunchDelaySeconds" -> app.maxLaunchDelay,
+        "container" -> app.container,
+        "healthChecks" -> app.healthChecks,
+        "dependencies" -> app.dependencies,
+        "upgradeStrategy" -> app.upgradeStrategy,
+        "labels" -> app.labels,
+        "acceptedResourceRoles" -> app.acceptedResourceRoles,
+        "version" -> app.version
+      )
     }
   }
 
-  implicit lazy val AppUpdateReads: Reads[AppUpdate] = {
+  implicit lazy val WithTaskCountsAndDeploymentsWrites: Writes[WithTaskCountsAndDeployments] =
+    Writes { app =>
+      val appJson = V2AppDefinitionWrites.writes(app).as[JsObject]
+
+      appJson ++ Json.obj(
+        "tasksStaged" -> app.tasksStaged,
+        "tasksRunning" -> app.tasksRunning,
+        "tasksHealthy" -> app.tasksHealthy,
+        "tasksUnhealthy" -> app.tasksUnhealthy,
+        "deployments" -> app.deployments
+      )
+    }
+
+  implicit lazy val WithTasksAndDeploymentsWrites: Writes[WithTasksAndDeployments] =
+    Writes { app =>
+      val appJson = WithTaskCountsAndDeploymentsWrites.writes(app).as[JsObject]
+      appJson ++ Json.obj(
+        "tasks" -> app.tasks
+      )
+    }
+
+  implicit lazy val WithTasksAndDeploymentsAndFailuresWrites: Writes[WithTasksAndDeploymentsAndTaskFailures] =
+    Writes { app =>
+      val appJson = WithTasksAndDeploymentsWrites.writes(app).as[JsObject]
+      appJson ++ Json.obj(
+        "lastTaskFailure" -> app.lastTaskFailure
+      )
+    }
+
+  implicit lazy val V2AppUpdateReads: Reads[V2AppUpdate] = {
 
     (
       (__ \ "id").readNullable[PathId].filterNot(_.exists(_.isRoot)) ~
-      (__ \ "cmd").readNullable[String] ~
+      (__ \ "cmd").readNullable[String](Reads.minLength(1)) ~
       (__ \ "args").readNullable[Seq[String]] ~
       (__ \ "user").readNullable[String] ~
       (__ \ "env").readNullable[Map[String, String]] ~
@@ -454,28 +526,50 @@ trait AppDefinitionFormats {
       (__ \ "container").readNullable[Container] ~
       (__ \ "healthChecks").readNullable[Set[HealthCheck]] ~
       (__ \ "dependencies").readNullable[Set[PathId]]
-    )(AppUpdate(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).flatMap { update =>
+    )(V2AppUpdate(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).flatMap { update =>
         // necessary because of case class limitations (good for another 21 fields)
         case class ExtraFields(
           upgradeStrategy: Option[UpgradeStrategy],
           labels: Option[Map[String, String]],
-          version: Option[Timestamp])
+          version: Option[Timestamp],
+          acceptedResourceRoles: Option[Set[String]])
 
         val extraReads: Reads[ExtraFields] =
           (
             (__ \ "upgradeStrategy").readNullable[UpgradeStrategy] ~
             (__ \ "labels").readNullable[Map[String, String]] ~
-            (__ \ "version").readNullable[Timestamp]
-          )(ExtraFields(_, _, _))
+            (__ \ "version").readNullable[Timestamp] ~
+            (__ \ "acceptedResourceRoles").readNullable[Set[String]](nonEmpty)
+          )(ExtraFields)
 
         extraReads.map { extraFields =>
           update.copy(
             upgradeStrategy = extraFields.upgradeStrategy,
             labels = extraFields.labels,
-            version = extraFields.version
+            version = extraFields.version,
+            acceptedResourceRoles = extraFields.acceptedResourceRoles
           )
         }
 
       }
   }
+
+  implicit lazy val V2GroupFormat: Format[V2Group] = (
+    (__ \ "id").format[PathId] ~
+    (__ \ "apps").formatNullable[Set[V2AppDefinition]].withDefault(V2Group.defaultApps) ~
+    (__ \ "groups").lazyFormatNullable(implicitly[Format[Set[V2Group]]]).withDefault(V2Group.defaultGroups) ~
+    (__ \ "dependencies").formatNullable[Set[PathId]].withDefault(Group.defaultDependencies) ~
+    (__ \ "version").formatNullable[Timestamp].withDefault(Group.defaultVersion)
+  )(V2Group(_, _, _, _, _), unlift(V2Group.unapply))
+
+  implicit lazy val V2DeploymentPlanWrites: Writes[V2DeploymentPlan] = Writes { plan =>
+    Json.obj(
+      "id" -> plan.id,
+      "original" -> plan.original,
+      "target" -> plan.target,
+      "steps" -> plan.steps,
+      "version" -> plan.version
+    )
+  }
 }
+

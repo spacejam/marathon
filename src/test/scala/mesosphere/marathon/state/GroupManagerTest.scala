@@ -3,21 +3,19 @@ package mesosphere.marathon.state
 import java.util.concurrent.atomic.AtomicInteger
 import javax.validation.ConstraintViolationException
 
-import akka.actor.{ ActorRefFactory, ActorSystem }
+import akka.actor.ActorSystem
 import akka.event.EventStream
 import akka.testkit.TestKit
-import com.google.inject.name.Named
-import mesosphere.marathon.event.EventModule
 import mesosphere.marathon.io.storage.StorageProvider
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.tasks.TaskTracker
-import mesosphere.marathon.{ MarathonSpec, MarathonConf, MarathonSchedulerService, PortRangeExhaustedException }
+import mesosphere.marathon.{ MarathonConf, MarathonSchedulerService, MarathonSpec, PortRangeExhaustedException }
 import mesosphere.util.SerializeExecution
 import org.mockito.Matchers.any
 import org.mockito.Mockito.{ times, verify, when }
 import org.rogach.scallop.ScallopConf
+import org.scalatest.Matchers
 import org.scalatest.mock.MockitoSugar
-import org.scalatest.{ FunSuite, Matchers }
 
 import scala.collection.immutable.Seq
 import scala.concurrent.duration._
@@ -34,12 +32,12 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
       AppDefinition("/app2".toPath, ports = Seq(1, 2, 3)),
       AppDefinition("/app2".toPath, ports = Seq(0, 2, 0))
     ))
-    val update = manager(10, 20).assignDynamicAppPort(Group.empty, group)
+    val update = manager(10, 20).assignDynamicServicePorts(Group.empty, group)
     update.transitiveApps.filter(_.hasDynamicPort) should be('empty)
     update.transitiveApps.flatMap(_.ports.filter(x => x >= 10 && x <= 20)) should have size 5
   }
 
-  test("Assign dynamic app ports specified in the container") {
+  test("Assign dynamic service ports specified in the container") {
     import Container.Docker
     import Docker.PortMapping
     import org.apache.mesos.Protos.ContainerInfo.DockerInfo.Network
@@ -57,9 +55,32 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
     val group = Group(PathId.empty, Set(
       AppDefinition("/app1".toPath, ports = Seq(), container = Some(container))
     ))
-    val update = manager(10, 20).assignDynamicAppPort(Group.empty, group)
+    val update = manager(minServicePort = 10, maxServicePort = 20).assignDynamicServicePorts(Group.empty, group)
     update.transitiveApps.filter(_.hasDynamicPort) should be ('empty)
     update.transitiveApps.flatMap(_.ports.filter(x => x >= 10 && x <= 20)) should have size 2
+  }
+
+  // Regression test for #1365
+  test("Export non-dynamic service ports specified in the container to the ports field") {
+    import Container.Docker
+    import Docker.PortMapping
+    import org.apache.mesos.Protos.ContainerInfo.DockerInfo.Network
+    val container = Container(
+      docker = Some(Docker(
+        image = "busybox",
+        network = Some(Network.BRIDGE),
+        portMappings = Some(Seq(
+          PortMapping(containerPort = 8080, hostPort = 0, servicePort = 80, protocol = "tcp"),
+          PortMapping (containerPort = 9000, hostPort = 10555, servicePort = 81, protocol = "udp")
+        ))
+      ))
+    )
+    val group = Group(PathId.empty, Set(
+      AppDefinition("/app1".toPath, container = Some(container))
+    ))
+    val update = manager(minServicePort = 90, maxServicePort = 900).assignDynamicServicePorts(Group.empty, group)
+    update.transitiveApps.filter(_.hasDynamicPort) should be ('empty)
+    update.transitiveApps.flatMap(_.ports) should equal (Set(80, 81).map(Integer.valueOf))
   }
 
   test("Already taken ports will not be used") {
@@ -67,7 +88,7 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
       AppDefinition("/app1".toPath, ports = Seq(0, 0, 0)),
       AppDefinition("/app2".toPath, ports = Seq(0, 2, 0))
     ))
-    val update = manager(10, 20).assignDynamicAppPort(Group.empty, group)
+    val update = manager(10, 20).assignDynamicServicePorts(Group.empty, group)
     update.transitiveApps.filter(_.hasDynamicPort) should be('empty)
     update.transitiveApps.flatMap(_.ports.filter(x => x >= 10 && x <= 20)) should have size 5
   }
@@ -78,7 +99,7 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
       AppDefinition("/app2".toPath, ports = Seq(0, 0, 0))
     ))
     val ex = intercept[PortRangeExhaustedException] {
-      manager(10, 15).assignDynamicAppPort(Group.empty, group)
+      manager(10, 15).assignDynamicServicePorts(Group.empty, group)
     }
     ex.minPort should be(10)
     ex.maxPort should be(15)
@@ -100,7 +121,7 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
       )
     ))
 
-    val result = manager(10, 15).assignDynamicAppPort(Group.empty, group)
+    val result = manager(10, 15).assignDynamicServicePorts(Group.empty, group)
     result.apps.size should be(1)
     val app = result.apps.head
     app.container should be (Some(container))
@@ -118,7 +139,7 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
 
     val group = Group(PathId.empty, Set(AppDefinition("/app1".toPath)), Set(Group("/group1".toPath)))
 
-    when(groupRepo.group("root", withLatestApps = false)).thenReturn(Future.successful(None))
+    when(groupRepo.group(groupRepo.zkRootName)).thenReturn(Future.successful(None))
 
     intercept[ConstraintViolationException] {
       Await.result(manager.update(group.id, _ => group), 3.seconds)
@@ -127,8 +148,10 @@ class GroupManagerTest extends TestKit(ActorSystem("System")) with MockitoSugar 
     verify(groupRepo, times(0)).store(any(), any())
   }
 
-  def manager(from: Int, to: Int) = {
-    val config = new ScallopConf(Seq("--master", "foo", "--local_port_min", from.toString, "--local_port_max", to.toString)) with MarathonConf
+  def manager(minServicePort: Int, maxServicePort: Int) = {
+    val config = new ScallopConf(Seq(
+      "--master", "foo",
+      "--local_port_min", minServicePort.toString, "--local_port_max", maxServicePort.toString)) with MarathonConf
     config.afterInit()
     val scheduler = mock[MarathonSchedulerService]
     val taskTracker = mock[TaskTracker]

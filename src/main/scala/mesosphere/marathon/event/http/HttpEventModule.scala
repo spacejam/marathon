@@ -1,38 +1,43 @@
 package mesosphere.marathon.event.http
 
-import scala.language.postfixOps
-import com.codahale.metrics.MetricRegistry
-import com.google.inject.{ Scopes, Singleton, Provides, AbstractModule }
-import akka.actor.{ Props, ActorRef, ActorSystem }
-import akka.pattern.ask
-import com.google.inject.name.Named
 import java.util.concurrent.Executors
-import scala.concurrent.ExecutionContext
-import org.rogach.scallop.ScallopConf
-import org.apache.log4j.Logger
-import scala.concurrent.duration._
+
+import akka.actor.{ ActorRef, ActorSystem, Props }
+import akka.pattern.ask
 import akka.util.Timeout
-import org.apache.mesos.state.State
-import mesosphere.marathon.state.MarathonStore
-import mesosphere.marathon.Main
+import com.codahale.metrics.MetricRegistry
+import com.google.inject.name.Named
+import com.google.inject.{ AbstractModule, Provides, Scopes, Singleton }
 import mesosphere.marathon.event.{ MarathonSubscriptionEvent, Subscribe }
-import mesosphere.marathon.MarathonConf
+import mesosphere.marathon.state.{ EntityStore, MarathonStore }
+import mesosphere.util.state.PersistentStore
+import org.apache.log4j.Logger
+import org.rogach.scallop.ScallopConf
+
+import scala.concurrent.ExecutionContext
+import scala.concurrent.duration._
+import scala.language.postfixOps
+import mesosphere.marathon.metrics.Metrics
 
 trait HttpEventConfiguration extends ScallopConf {
 
-  lazy val httpEventEndpoints = opt[List[String]]("http_endpoints",
-    descr = "The URLs of the event endpoints master",
+  lazy val httpEventEndpoints = opt[String]("http_endpoints",
+    descr = "The URLs of the event endpoints",
     required = false,
-    noshort = true)
+    noshort = true).map(parseHttpEventEndpoints)
+
+  private[this] def parseHttpEventEndpoints(str: String): List[String] =
+    str.split(',').map(_.trim).toList
 }
 
-class HttpEventModule extends AbstractModule {
+class HttpEventModule(httpEventConfiguration: HttpEventConfiguration) extends AbstractModule {
 
   val log = Logger.getLogger(getClass.getName)
 
   def configure() {
     bind(classOf[HttpCallbackEventSubscriber]).asEagerSingleton()
     bind(classOf[HttpCallbackSubscriptionService]).in(Scopes.SINGLETON)
+    bind(classOf[HttpEventConfiguration]).toInstance(httpEventConfiguration)
   }
 
   @Provides
@@ -44,14 +49,15 @@ class HttpEventModule extends AbstractModule {
 
   @Provides
   @Named(HttpEventModule.SubscribersKeeperActor)
-  def provideSubscribersKeeperActor(system: ActorSystem,
-                                    store: MarathonStore[EventSubscribers]): ActorRef = {
+  def provideSubscribersKeeperActor(conf: HttpEventConfiguration,
+                                    system: ActorSystem,
+                                    store: EntityStore[EventSubscribers]): ActorRef = {
     implicit val timeout = HttpEventModule.timeout
     implicit val ec = HttpEventModule.executionContext
     val local_ip = java.net.InetAddress.getLocalHost.getHostAddress
 
     val actor = system.actorOf(Props(new SubscribersKeeperActor(store)))
-    Main.conf.httpEventEndpoints.get foreach { urls =>
+    conf.httpEventEndpoints.get foreach { urls =>
       log.info(s"http_endpoints($urls) are specified at startup. Those will be added to subscribers list.")
       urls foreach { url =>
         val f = (actor ? Subscribe(local_ip, url)).mapTo[MarathonSubscriptionEvent]
@@ -67,9 +73,9 @@ class HttpEventModule extends AbstractModule {
 
   @Provides
   @Singleton
-  def provideCallbackUrlsStore(conf: MarathonConf,
-                               state: State, registry: MetricRegistry): MarathonStore[EventSubscribers] =
-    new MarathonStore[EventSubscribers](conf, state, registry, () => new EventSubscribers(Set.empty[String]), "events:")
+  def provideCallbackUrlsStore(store: PersistentStore, metrics: Metrics): EntityStore[EventSubscribers] = {
+    new MarathonStore[EventSubscribers](store, metrics, () => new EventSubscribers(Set.empty[String]), "events:")
+  }
 }
 
 object HttpEventModule {
